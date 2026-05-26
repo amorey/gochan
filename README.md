@@ -48,7 +48,7 @@ result, _ := rx.Recv()
 **SPSC** — stream values between a single producer and consumer:
 
 ```go
-tx, rx, closeAll := spsc.NewBounded[int](64)
+tx, rx, closeAll := spsc.New[int](64)
 defer closeAll()
 
 go func() {
@@ -65,7 +65,7 @@ for {
 **SPMC** — distribute work from one producer across a pool of workers:
 
 ```go
-hub := spmc.NewBounded[Job](128)
+hub := spmc.New[Job](128)
 defer hub.Close()
 tx := hub.Sender()
 
@@ -87,7 +87,7 @@ tx.Close()
 **MPSC** — fan-in workers to a single collector:
 
 ```go
-hub := mpsc.NewBounded[Event](256)
+hub := mpsc.New[Event](256)
 defer hub.Close()
 rx := hub.Receiver()
 
@@ -105,7 +105,7 @@ for {
 **MPMC** — shared queue feeding a worker pool from many producers:
 
 ```go
-hub := mpmc.NewBounded[Task](256)
+hub := mpmc.New[Task](256)
 defer hub.Close()
 
 for i := 0; i < producers; i++ {
@@ -160,11 +160,9 @@ for {
 
 Here are some design decisions to be aware of:
 
-**Bounded by default**: Unbounded queues are a memory-safety footgun. Only `mpsc` offers an unbounded variant, and the doc comment warns about it. Everything else takes an explicit capacity.
+**Bounded by default**: Unbounded queues are a memory-safety footgun. Every queue-style constructor takes an explicit capacity.
 
-**Queue-style channel capacity**: (`spsc`, `spmc`, `mpsc (bounded)`, `mpmc`), capacity behaves exactly like Go's buffered channels because the implementation *is* a buffered Go channel underneath. `NewBounded[T](0)` is a rendezvous channel — `Send` blocks until a `Recv` is ready. `NewBounded[T](n)` allows `n` queued values before `Send` blocks.
-
-**`mpsc.NewUnbounded` grows as needed**: Use this when bursts are unavoidable and bounded back-pressure would deadlock you — but watch for memory growth if producers can outrun the consumer indefinitely.
+**Queue-style channel capacity**: (`spsc`, `spmc`, `mpsc`, `mpmc`), capacity behaves exactly like Go's buffered channels because the implementation *is* a buffered Go channel underneath. `New[T](0)` is a rendezvous channel — `Send` blocks until a `Recv` is ready. `New[T](n)` allows `n` queued values before `Send` blocks.
 
 **One close-all per package**: Every constructor exposes a single "close everything" entry point alongside the per-handle `Sender.Close()` and `Receiver.Close()`. Singleton-pair packages (`oneshot`, `spsc`) return a `func()` as the third value of their constructor; multi-side packages return a `*Hub[T]` whose `Close()` method serves the same purpose. In both cases the function is equivalent to calling `Close()` on every handle: the sender's close drains buffered values (`Chan` consumers drain then exit), while the receiver-side close immediately fails `Recv`/`TryRecv`/`RecvContext` with `ErrClosed`. Inherits the sender's close discipline — don't call it concurrently with an active `Send` from a different goroutine.
 
@@ -179,16 +177,15 @@ Here are some design decisions to be aware of:
 
 Singleton-pair packages (`oneshot`, `spsc`) return `(*Sender, *Receiver, func())` directly — both handles plus a close function that calls `Close` on each. Multi-side packages return a `*Hub[T]` that hands out `Sender` and `Receiver` handles via `hub.Sender()` / `hub.Receiver()` and exposes `hub.Close()` which closes every live handle.
 
-| Constructor              | Returns                              | Capacity arg | `0` allowed?     |
-| ------------------------ | ------------------------------------ | ------------ | ---------------- |
-| `oneshot.New[T]()`       | `(*Sender[T], *Receiver[T], func())` | —            | —                |
-| `spsc.NewBounded[T](n)`  | `(*Sender[T], *Receiver[T], func())` | yes          | yes (rendezvous) |
-| `spmc.NewBounded[T](n)`  | `*Hub[T]`                            | yes          | yes (rendezvous) |
-| `mpsc.NewBounded[T](n)`  | `*Hub[T]`                            | yes          | yes (rendezvous) |
-| `mpsc.NewUnbounded[T]()` | `*Hub[T]`                            | —            | —                |
-| `mpmc.NewBounded[T](n)`  | `*Hub[T]`                            | yes          | yes (rendezvous) |
-| `broadcast.New[T](n)`    | `*Hub[T]`                            | yes          | no (panics)      |
-| `watch.New[T](initial)`  | `*Hub[T]`                            | —            | —                |
+| Constructor             | Returns                              | Capacity arg | `0` allowed?     |
+| ----------------------- | ------------------------------------ | ------------ | ---------------- |
+| `oneshot.New[T]()`      | `(*Sender[T], *Receiver[T], func())` | —            | —                |
+| `spsc.New[T](n)`        | `(*Sender[T], *Receiver[T], func())` | yes          | yes (rendezvous) |
+| `spmc.New[T](n)`        | `*Hub[T]`                            | yes          | yes (rendezvous) |
+| `mpsc.New[T](n)`        | `*Hub[T]`                            | yes          | yes (rendezvous) |
+| `mpmc.New[T](n)`        | `*Hub[T]`                            | yes          | yes (rendezvous) |
+| `broadcast.New[T](n)`   | `*Hub[T]`                            | yes          | no (panics)      |
+| `watch.New[T](initial)` | `*Hub[T]`                            | —            | —                |
 
 ### Common interfaces
 
@@ -229,7 +226,7 @@ The `Chan()` method on every receiver gives you a native `chan` for use in `sele
 
 ### Close semantics
 
-There are two close operations: per-handle (`Sender.Close()` / `Receiver.Close()`), and close-all (`Hub.Close()` or the function returned by `oneshot.New` / `spsc.NewBounded`). Close-all is exactly equivalent to calling `Close()` on every handle the hub has handed out — no separate semantics.
+There are two close operations: per-handle (`Sender.Close()` / `Receiver.Close()`), and close-all (`Hub.Close()` or the function returned by `oneshot.New` / `spsc.New`). Close-all is exactly equivalent to calling `Close()` on every handle the hub has handed out — no separate semantics.
 
 | Call                | Effect                                                                                                    |
 | ------------------- | --------------------------------------------------------------------------------------------------------- |
@@ -332,7 +329,7 @@ func (rx *Receiver[T]) Close()
 
 A single-producer, single-consumer FIFO queue. One `Sender` feeds values in
 order to one `Receiver`. Capacity behaves exactly like a Go buffered channel:
-`NewBounded[T](0)` is a rendezvous channel, `NewBounded[T](n)` allows `n`
+`New[T](0)` is a rendezvous channel, `New[T](n)` allows `n`
 queued values before `Send` blocks.
 
 Typical uses: streaming pipelines between two cooperating goroutines, a
@@ -342,11 +339,11 @@ a slow consumer with a fixed-size buffer.
 **Constructor**
 
 ```go
-func NewBounded[T any](capacity int) (*Sender[T], *Receiver[T], func())
+func New[T any](capacity int) (*Sender[T], *Receiver[T], func())
 ```
 
 <dl>
-  <dt><code>NewBounded[T](capacity)</code></dt>
+  <dt><code>New[T](capacity)</code></dt>
   <dd>Creates a fresh spsc pair backed by a buffered Go channel of the given <code>capacity</code>, returning a sender, a receiver, and a close function that calls <code>Close</code> on both (Receiver first, then Sender, so an in-flight <code>Send</code> escapes via the receiver-close signal before the underlying channel is closed). <code>capacity == 0</code> yields a rendezvous channel where <code>Send</code> blocks until a matching <code>Recv</code> is ready. <code>capacity &lt; 0</code> panics. The close function is idempotent and safe to defer; it inherits the sender's close discipline — don't call it concurrently with an active <code>Send</code> from a different goroutine.</dd>
 </dl>
 
@@ -388,7 +385,7 @@ func (rx *Receiver[T]) Close()
   <dt><code>RecvContext(ctx) (T, error)</code></dt>
   <dd>Like <code>Recv</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled first. Cancellation does <em>not</em> close the receiver; subsequent calls remain valid.</dd>
   <dt><code>Chan() &lt;-chan T</code></dt>
-  <dd>Returns the underlying receive-only channel, suitable for use in <code>select</code>. The channel is closed when the sender closes (directly or via the close function returned by <code>NewBounded</code>) and the buffer drains. Closing the receiver does <em>not</em> close this channel — use <code>Recv</code>/<code>TryRecv</code> if you need to observe receiver-close. Repeated calls return the same channel.</dd>
+  <dd>Returns the underlying receive-only channel, suitable for use in <code>select</code>. The channel is closed when the sender closes (directly or via the close function returned by <code>New</code>) and the buffer drains. Closing the receiver does <em>not</em> close this channel — use <code>Recv</code>/<code>TryRecv</code> if you need to observe receiver-close. Repeated calls return the same channel.</dd>
   <dt><code>Close()</code></dt>
   <dd>Closes the receiver. Pending or future <code>Send</code> calls return <code>ErrClosed</code>, and subsequent <code>Recv</code>/<code>TryRecv</code>/<code>RecvContext</code> calls return <code>ErrClosed</code>. Any values still buffered are abandoned. Idempotent.</dd>
 </dl>
@@ -405,7 +402,7 @@ func (rx *Receiver[T]) Close()
   <dt>Backpressure</dt>
   <dd>A bounded buffer applies natural backpressure: when full, <code>Send</code> blocks until the consumer makes room. Use <code>capacity == 0</code> for strict rendezvous handoff with no buffering.</dd>
   <dt>Close-all</dt>
-  <dd>The close function returned by <code>NewBounded</code> calls <code>rx.Close()</code> then <code>tx.Close()</code>. Unblocks both sides with <code>ErrClosed</code> (Recv-style abandons buffered values; <code>Chan</code> consumers drain remaining values then see channel-closed).</dd>
+  <dd>The close function returned by <code>New</code> calls <code>rx.Close()</code> then <code>tx.Close()</code>. Unblocks both sides with <code>ErrClosed</code> (Recv-style abandons buffered values; <code>Chan</code> consumers drain remaining values then see channel-closed).</dd>
 </dl>
 
 #### spmc
@@ -413,8 +410,8 @@ func (rx *Receiver[T]) Close()
 A single-producer, multi-consumer FIFO queue. One `Sender` feeds values into
 a bounded buffer that is drained by any number of `Receiver`s, with each
 value delivered to exactly one receiver. Capacity behaves exactly like a Go
-buffered channel: `NewBounded[T](0)` is a rendezvous channel,
-`NewBounded[T](n)` allows `n` queued values before `Send` blocks.
+buffered channel: `New[T](0)` is a rendezvous channel,
+`New[T](n)` allows `n` queued values before `Send` blocks.
 
 Typical uses: distributing work items to a pool of workers from a single
 dispatcher goroutine, parallelizing a CPU-bound pipeline stage, fanning a
@@ -426,11 +423,11 @@ Unlike `broadcast`, every value goes to *one* receiver, not all of them —
 **Constructor**
 
 ```go
-func NewBounded[T any](capacity int) *Hub[T]
+func New[T any](capacity int) *Hub[T]
 ```
 
 <dl>
-  <dt><code>NewBounded[T](capacity)</code></dt>
+  <dt><code>New[T](capacity)</code></dt>
   <dd>Creates a fresh spmc hub backed by a buffered Go channel of the given <code>capacity</code>. <code>capacity == 0</code> yields a rendezvous channel where <code>Send</code> blocks until some receiver is ready. <code>capacity &lt; 0</code> panics. A freshly constructed hub has no receivers, so <code>Send</code> will block (or <code>TrySend</code> will report <code>ErrFull</code>) until at least one <code>Receiver</code> is registered via <a href="#spmc-receiver"><code>hub.Receiver()</code></a>.</dd>
 </dl>
 
@@ -515,24 +512,21 @@ func (rx *Receiver[T]) Close()
 
 #### mpsc
 
-A multiple-producer, single-consumer FIFO queue. Any number of `Sender` handles feed values into a shared queue drained by one `Receiver`. Two flavors are provided: a bounded buffer (`NewBounded`) that applies backpressure, and an unbounded buffer (`NewUnbounded`) that grows as needed.
+A multiple-producer, single-consumer FIFO queue. Any number of `Sender` handles feed values into a shared, fixed-capacity buffer drained by one `Receiver`. Capacity behaves exactly like a Go buffered channel: `New[T](0)` is a rendezvous channel, `New[T](n)` allows `n` queued values before `Send` blocks.
 
 Typical uses: fan-in of events from many worker goroutines into a single
 aggregator, collecting results from a scatter of parallel tasks, funnelling
 log/metric/event streams to one writer.
 
-**Constructors**
+**Constructor**
 
 ```go
-func NewBounded[T any](capacity int) *Hub[T]
-func NewUnbounded[T any]()           *Hub[T]
+func New[T any](capacity int) *Hub[T]
 ```
 
 <dl>
-  <dt><code>NewBounded[T](capacity)</code></dt>
-  <dd>Creates a fresh mpsc hub backed by a buffered Go channel of the given <code>capacity</code>. <code>capacity == 0</code> yields a rendezvous channel where every <code>Send</code> blocks until the receiver is ready. <code>capacity &lt; 0</code> panics. Bounded variants give you natural backpressure: when the buffer is full, producers wait.</dd>
-  <dt><code>NewUnbounded[T]()</code></dt>
-  <dd>Creates a fresh mpsc hub with an unbounded internal queue. <code>Send</code> never blocks on capacity (only on closed state). Use this when bursts are unavoidable and bounded backpressure would deadlock you — but watch for memory growth if producers can outrun the consumer indefinitely. <code>TrySend</code> never returns <code>ErrFull</code>.</dd>
+  <dt><code>New[T](capacity)</code></dt>
+  <dd>Creates a fresh mpsc hub backed by a buffered Go channel of the given <code>capacity</code>. <code>capacity == 0</code> yields a rendezvous channel where every <code>Send</code> blocks until the receiver is ready. <code>capacity &lt; 0</code> panics. Bounded mpsc gives you natural backpressure: when the buffer is full, producers wait.</dd>
 </dl>
 
 A freshly constructed mpsc hub has no senders, so <code>Recv</code> will block (or <code>TryRecv</code> will report <code>ErrEmpty</code>) until at least one producer is registered via <a href="#mpsc-sender"><code>hub.Sender()</code></a> and sends a value. The "all senders closed ⇒ <code>ErrClosed</code>" rule only kicks in once at least one sender has been registered — a fresh hub is not implicitly closed.
@@ -588,11 +582,11 @@ func (tx *Sender[T]) Close()
 
 <dl>
   <dt><code>Send(v) error</code></dt>
-  <dd>Enqueues <code>v</code>. For bounded mpsc, blocks while the buffer is full; for unbounded mpsc, returns as soon as the value is appended. Returns <code>ErrClosed</code> if this sender has been closed, the receiver has been closed, or the hub has been closed; on <code>ErrClosed</code> the value is dropped.</dd>
+  <dd>Enqueues <code>v</code>, blocking while the buffer is full. Returns <code>ErrClosed</code> if this sender has been closed, the receiver has been closed, or the hub has been closed; on <code>ErrClosed</code> the value is dropped.</dd>
   <dt><code>TrySend(v) error</code></dt>
-  <dd>Non-blocking. Returns <code>ErrFull</code> if a bounded buffer is full, <code>ErrClosed</code> if closed, or <code>nil</code> on success. For unbounded mpsc, <code>ErrFull</code> is never returned.</dd>
+  <dd>Non-blocking. Returns <code>ErrFull</code> if the buffer is full, <code>ErrClosed</code> if closed, or <code>nil</code> on success.</dd>
   <dt><code>SendContext(ctx, v) error</code></dt>
-  <dd>Like <code>Send</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled before the value is enqueued. The value is dropped on cancellation. For unbounded mpsc, cancellation effectively only matters at entry, since the enqueue itself doesn't block.</dd>
+  <dd>Like <code>Send</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled before the value is enqueued. The value is dropped on cancellation.</dd>
   <dt><code>Close()</code></dt>
   <dd>Closes this sender only. Other senders continue to produce. Subsequent <code>Send</code>/<code>TrySend</code>/<code>SendContext</code> calls on this handle return <code>ErrClosed</code>. The receiver only observes <code>ErrClosed</code> (after draining) when <em>every</em> sender has been closed. Idempotent. Intended to be called by the producer goroutine that owns this sender — mpsc does not synchronize concurrent callers on the same sender handle.</dd>
 </dl>
@@ -608,8 +602,8 @@ func (tx *Sender[T]) Close()
   <dd>Once at least one sender has been registered, the receiver observes <code>ErrClosed</code> when both (a) every sender obtained from <code>hub.Sender()</code> has been closed and (b) the buffer is empty. A freshly constructed hub with zero senders ever registered is <em>not</em> treated as closed — <code>Recv</code> blocks waiting for the first producer. If you spawn N producers, you must close all N — a forgotten <code>Close</code> on any one of them leaves the receiver waiting forever for an EOF that never arrives.</dd>
   <dt>Receiver close stops everything</dt>
   <dd>Closing the receiver immediately fails every pending and future <code>Send</code> across all senders with <code>ErrClosed</code> and abandons any buffered values.</dd>
-  <dt>Bounded vs unbounded backpressure</dt>
-  <dd><code>NewBounded</code> applies natural backpressure: when full, <code>Send</code> blocks until the consumer makes room. <code>NewUnbounded</code> trades that backpressure for memory growth — appropriate when bursts are bounded by upstream logic, inappropriate when producers can outrun the consumer indefinitely.</dd>
+  <dt>Backpressure</dt>
+  <dd>A bounded buffer applies natural backpressure: when full, <code>Send</code> blocks until the consumer makes room. Use <code>capacity == 0</code> for strict rendezvous handoff with no buffering.</dd>
   <dt>Hub close-all</dt>
   <dd><code>Hub.Close()</code> calls <code>Close</code> on every live sender and on the receiver. Recv-style callers see <code>ErrClosed</code> immediately; <code>Chan</code> consumers drain remaining values before seeing channel-closed.</dd>
 </dl>

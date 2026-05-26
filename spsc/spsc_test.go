@@ -15,7 +15,7 @@ import (
 
 func newPair[T any](t *testing.T, capacity int) (tx *spsc.Sender[T], rx *spsc.Receiver[T], kill func()) {
 	t.Helper()
-	return spsc.NewBounded[T](capacity)
+	return spsc.New[T](capacity)
 }
 
 func TestImplementsCommonInterfaces(t *testing.T) {
@@ -25,7 +25,7 @@ func TestImplementsCommonInterfaces(t *testing.T) {
 }
 
 func TestNegativeCapacityPanics(t *testing.T) {
-	assert.Panics(t, func() { spsc.NewBounded[int](-1) })
+	assert.Panics(t, func() { spsc.New[int](-1) })
 }
 
 func TestSendRecvFIFO(t *testing.T) {
@@ -261,7 +261,7 @@ func TestKillUnblocksReceiver(t *testing.T) {
 }
 
 func TestKillIdempotent(t *testing.T) {
-	_, _, kill := spsc.NewBounded[int](1)
+	_, _, kill := spsc.New[int](1)
 	assert.NotPanics(t, func() {
 		kill()
 		kill()
@@ -275,7 +275,7 @@ func TestKillIdempotent(t *testing.T) {
 // scheduling orders.
 func TestKillRaceWithBlockedSender(t *testing.T) {
 	for i := 0; i < 2000; i++ {
-		tx, _, kill := spsc.NewBounded[int](1)
+		tx, _, kill := spsc.New[int](1)
 		require.NoError(t, tx.Send(1)) // fill buffer; next Send must block
 		errCh := make(chan error, 1)
 		go func() { errCh <- tx.Send(2) }()
@@ -291,7 +291,7 @@ func TestCloseAllowsChanDrain(t *testing.T) {
 	// fires, but Chan() consumers can still drain anything buffered before
 	// the close — the underlying channel is closed (drain-then-exit), not
 	// abandoned.
-	tx, rx, kill := spsc.NewBounded[int](4)
+	tx, rx, kill := spsc.New[int](4)
 	require.NoError(t, tx.Send(1))
 	require.NoError(t, tx.Send(2))
 	ch := rx.Chan()

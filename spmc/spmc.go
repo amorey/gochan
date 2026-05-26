@@ -3,8 +3,8 @@
 // A [Hub] hands out one [Sender] and any number of [Receiver]s. The sender
 // feeds values into a bounded buffer that is drained by the receivers,
 // with each value delivered to exactly one receiver. Capacity behaves
-// exactly like a Go buffered channel: NewBounded[T](0) is a rendezvous
-// channel, NewBounded[T](n) allows n queued values before Send blocks.
+// exactly like a Go buffered channel: New[T](0) is a rendezvous
+// channel, New[T](n) allows n queued values before Send blocks.
 //
 // Exactly one goroutine should call Send/Close on the sender; [Hub.Receiver]
 // is safe to call from any goroutine. Each *Receiver[T] is intended for
@@ -61,14 +61,14 @@ type Receiver[T any] struct {
 	closed bool
 }
 
-// NewBounded creates a fresh spmc Hub backed by a buffered Go channel of
+// New creates a fresh spmc Hub backed by a buffered Go channel of
 // the given capacity. capacity == 0 yields a rendezvous channel where Send
 // blocks until some receiver is ready. capacity < 0 panics.
 //
 // Receivers are obtained from the hub via [Hub.Receiver]; a freshly
 // constructed hub has no receivers, so Send will block (or TrySend will
 // report ErrFull) until at least one receiver is registered.
-func NewBounded[T any](capacity int) *Hub[T] {
+func New[T any](capacity int) *Hub[T] {
 	if capacity < 0 {
 		panic("spmc: negative capacity")
 	}

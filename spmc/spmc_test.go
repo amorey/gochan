@@ -16,7 +16,7 @@ import (
 
 func newHubTx[T any](t *testing.T, capacity int) (*spmc.Hub[T], *spmc.Sender[T]) {
 	t.Helper()
-	h := spmc.NewBounded[T](capacity)
+	h := spmc.New[T](capacity)
 	return h, h.Sender().(*spmc.Sender[T])
 }
 
@@ -34,7 +34,7 @@ func TestImplementsCommonInterfaces(t *testing.T) {
 }
 
 func TestNegativeCapacityPanics(t *testing.T) {
-	assert.Panics(t, func() { spmc.NewBounded[int](-1) })
+	assert.Panics(t, func() { spmc.New[int](-1) })
 }
 
 func TestSendRecvSingleReceiver(t *testing.T) {
@@ -335,12 +335,12 @@ func TestRecvReturnsClosedAfterReceiverClose(t *testing.T) {
 }
 
 func TestSenderIsIdempotent(t *testing.T) {
-	h := spmc.NewBounded[int](1)
+	h := spmc.New[int](1)
 	assert.Same(t, h.Sender(), h.Sender())
 }
 
 func TestSenderReceiverAfterHubCloseAreClosed(t *testing.T) {
-	h := spmc.NewBounded[int](1)
+	h := spmc.New[int](1)
 	h.Close()
 	tx := h.Sender()
 	assert.ErrorIs(t, tx.Send(1), gochan.ErrClosed)
@@ -392,7 +392,7 @@ func TestHubCloseUnblocksReceivers(t *testing.T) {
 }
 
 func TestHubCloseIdempotent(t *testing.T) {
-	h := spmc.NewBounded[int](1)
+	h := spmc.New[int](1)
 	assert.NotPanics(t, func() {
 		h.Close()
 		h.Close()

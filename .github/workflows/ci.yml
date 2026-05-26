@@ -1,0 +1,53 @@
+name: ci
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        go-version: &go-versions [1.21, 1.22, 1.23, 1.24, 1.25, 1.26]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+      - name: Run linter
+        run: test -z "$(gofmt -l .)"
+
+  vet:
+    name: Vet
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        go-version: *go-versions
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+      - name: Run vetter
+        run: go vet ./...
+
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        go-version: *go-versions
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+      - name: Run tests
+        run: go test -race ./...

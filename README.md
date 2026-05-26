@@ -842,6 +842,7 @@ Fire-and-forget telemetry — publisher doesn't care about lag, subscribers hand
 
 ```go
 hub := broadcast.New[Metric](1024)
+
 tx := hub.Sender()
 go func() {
     for m := range metricStream {

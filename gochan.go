@@ -2,6 +2,25 @@ package gochan
 
 import "context"
 
+// Hub is the construction-handle interface implemented by multi-side
+// channel packages in this module. Each subpackage's *Hub[T] satisfies
+// it.
+type Hub[T any] interface {
+	// Sender hands out a send-side handle. On singleton-Sender packages
+	// it returns the same handle on every call; on multi-Sender packages
+	// it returns a fresh handle each time. After the hub is closed the
+	// returned handle reports ErrClosed on use.
+	Sender() Sender[T]
+	// Receiver hands out a receive-side handle. On singleton-Receiver
+	// packages it returns the same handle on every call; on
+	// multi-Receiver packages it returns a fresh handle each time.
+	// After the hub is closed the returned handle reports ErrClosed on
+	// use.
+	Receiver() Receiver[T]
+	// Close is the hub-wide kill-switch. Idempotent.
+	Close()
+}
+
 // Sender is the common send-side interface implemented by every channel type
 // in this module.
 type Sender[T any] interface {

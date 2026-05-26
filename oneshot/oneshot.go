@@ -1,8 +1,9 @@
 // Package oneshot provides a single-value, single-delivery channel.
 //
 // Exactly one Send will ever succeed and the value is delivered to exactly
-// one Recv. Either side may cancel by closing its handle; the other side
-// observes [gochan.ErrClosed] on its next operation.
+// one Recv. [New] hands out a sender, a receiver, and a close function
+// that calls Close on both. Either side may cancel by closing its handle,
+// and the other side observes [gochan.ErrClosed] on its next operation.
 package oneshot
 
 import (
@@ -32,10 +33,17 @@ type Sender[T any] struct{ s *shared[T] }
 // Receiver is the receive-side handle of a oneshot pair.
 type Receiver[T any] struct{ s *shared[T] }
 
-// New creates a fresh oneshot pair sharing a single value slot.
-func New[T any]() (*Sender[T], *Receiver[T]) {
+// New creates a fresh oneshot pair: a sender, a receiver, and a close
+// function that calls Close on both. The close function is idempotent and
+// safe to defer.
+func New[T any]() (*Sender[T], *Receiver[T], func()) {
 	s := &shared[T]{done: make(chan struct{})}
-	return &Sender[T]{s: s}, &Receiver[T]{s: s}
+	tx := &Sender[T]{s: s}
+	rx := &Receiver[T]{s: s}
+	return tx, rx, func() {
+		rx.Close()
+		tx.Close()
+	}
 }
 
 // Send deposits v into the slot and returns immediately without waiting for a

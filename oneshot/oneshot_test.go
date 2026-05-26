@@ -13,14 +13,19 @@ import (
 	"github.com/amorey/gochan/oneshot"
 )
 
+func newPair[T any](t *testing.T) (tx *oneshot.Sender[T], rx *oneshot.Receiver[T], kill func()) {
+	t.Helper()
+	return oneshot.New[T]()
+}
+
 func TestImplementsCommonInterfaces(t *testing.T) {
-	tx, rx := oneshot.New[int]()
+	tx, rx, _ := newPair[int](t)
 	var _ gochan.Sender[int] = tx
 	var _ gochan.Receiver[int] = rx
 }
 
 func TestSendThenRecv(t *testing.T) {
-	tx, rx := oneshot.New[int]()
+	tx, rx, _ := newPair[int](t)
 	require.NoError(t, tx.Send(42))
 	v, err := rx.Recv()
 	require.NoError(t, err)
@@ -28,7 +33,7 @@ func TestSendThenRecv(t *testing.T) {
 }
 
 func TestSendDoesNotBlockOnReceiver(t *testing.T) {
-	tx, rx := oneshot.New[string]()
+	tx, rx, _ := newPair[string](t)
 	done := make(chan struct{})
 	go func() {
 		_ = tx.Send("hi")
@@ -45,7 +50,7 @@ func TestSendDoesNotBlockOnReceiver(t *testing.T) {
 }
 
 func TestRecvBlocksUntilSend(t *testing.T) {
-	tx, rx := oneshot.New[int]()
+	tx, rx, _ := newPair[int](t)
 	type result struct {
 		v   int
 		err error
@@ -71,13 +76,13 @@ func TestRecvBlocksUntilSend(t *testing.T) {
 }
 
 func TestDoubleSendErrClosed(t *testing.T) {
-	tx, _ := oneshot.New[int]()
+	tx, _, _ := newPair[int](t)
 	require.NoError(t, tx.Send(1))
 	assert.ErrorIs(t, tx.Send(2), gochan.ErrClosed)
 }
 
 func TestSenderCloseBeforeSendCausesRecvErrClosed(t *testing.T) {
-	tx, rx := oneshot.New[int]()
+	tx, rx, _ := newPair[int](t)
 	tx.Close()
 	_, err := rx.Recv()
 	assert.ErrorIs(t, err, gochan.ErrClosed)
@@ -85,7 +90,7 @@ func TestSenderCloseBeforeSendCausesRecvErrClosed(t *testing.T) {
 }
 
 func TestSenderCloseAfterSendIsNoop(t *testing.T) {
-	tx, rx := oneshot.New[int]()
+	tx, rx, _ := newPair[int](t)
 	require.NoError(t, tx.Send(5))
 	tx.Close()
 	v, err := rx.Recv()
@@ -94,7 +99,7 @@ func TestSenderCloseAfterSendIsNoop(t *testing.T) {
 }
 
 func TestSenderCloseIdempotent(t *testing.T) {
-	tx, _ := oneshot.New[int]()
+	tx, _, _ := newPair[int](t)
 	assert.NotPanics(t, func() {
 		tx.Close()
 		tx.Close()
@@ -102,13 +107,13 @@ func TestSenderCloseIdempotent(t *testing.T) {
 }
 
 func TestReceiverCloseBeforeSend(t *testing.T) {
-	tx, rx := oneshot.New[int]()
+	tx, rx, _ := newPair[int](t)
 	rx.Close()
 	assert.ErrorIs(t, tx.Send(1), gochan.ErrClosed)
 }
 
 func TestReceiverCloseUnblocksRecv(t *testing.T) {
-	_, rx := oneshot.New[int]()
+	_, rx, _ := newPair[int](t)
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		rx.Close()
@@ -118,7 +123,7 @@ func TestReceiverCloseUnblocksRecv(t *testing.T) {
 }
 
 func TestReceiverCloseIdempotent(t *testing.T) {
-	_, rx := oneshot.New[int]()
+	_, rx, _ := newPair[int](t)
 	assert.NotPanics(t, func() {
 		rx.Close()
 		rx.Close()
@@ -126,13 +131,13 @@ func TestReceiverCloseIdempotent(t *testing.T) {
 }
 
 func TestTryRecvEmpty(t *testing.T) {
-	_, rx := oneshot.New[int]()
+	_, rx, _ := newPair[int](t)
 	_, err := rx.TryRecv()
 	assert.ErrorIs(t, err, gochan.ErrEmpty)
 }
 
 func TestTryRecvValue(t *testing.T) {
-	tx, rx := oneshot.New[int]()
+	tx, rx, _ := newPair[int](t)
 	require.NoError(t, tx.Send(11))
 	v, err := rx.TryRecv()
 	require.NoError(t, err)
@@ -142,14 +147,14 @@ func TestTryRecvValue(t *testing.T) {
 }
 
 func TestTryRecvAfterSenderClose(t *testing.T) {
-	tx, rx := oneshot.New[int]()
+	tx, rx, _ := newPair[int](t)
 	tx.Close()
 	_, err := rx.TryRecv()
 	assert.ErrorIs(t, err, gochan.ErrClosed)
 }
 
 func TestSendContextCancelledReturnsCtxErr(t *testing.T) {
-	tx, rx := oneshot.New[int]()
+	tx, rx, _ := newPair[int](t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	assert.ErrorIs(t, tx.SendContext(ctx, 1), context.Canceled)
@@ -160,7 +165,7 @@ func TestSendContextCancelledReturnsCtxErr(t *testing.T) {
 }
 
 func TestSendContextOK(t *testing.T) {
-	tx, rx := oneshot.New[int]()
+	tx, rx, _ := newPair[int](t)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	require.NoError(t, tx.SendContext(ctx, 7))
@@ -170,7 +175,7 @@ func TestSendContextOK(t *testing.T) {
 }
 
 func TestRecvContextCancel(t *testing.T) {
-	tx, rx := oneshot.New[int]()
+	tx, rx, _ := newPair[int](t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := rx.RecvContext(ctx)
@@ -182,7 +187,7 @@ func TestRecvContextCancel(t *testing.T) {
 }
 
 func TestRecvContextSucceeds(t *testing.T) {
-	tx, rx := oneshot.New[int]()
+	tx, rx, _ := newPair[int](t)
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		_ = tx.Send(9)
@@ -198,7 +203,7 @@ func TestRecvContextPrefersValueOverCancel(t *testing.T) {
 	// When both ctx is cancelled and a value is available, RecvContext must
 	// deliver the value rather than report ctx.Err().
 	for i := 0; i < 200; i++ {
-		tx, rx := oneshot.New[int]()
+		tx, rx, _ := newPair[int](t)
 		require.NoError(t, tx.Send(42))
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
@@ -211,7 +216,7 @@ func TestRecvContextPrefersValueOverCancel(t *testing.T) {
 func TestReceiverCloseAfterSendDropsValue(t *testing.T) {
 	// rx.Close after a successful Send must drop the pending value (per spec).
 	type big struct{ payload [1024]byte }
-	tx, rx := oneshot.New[*big]()
+	tx, rx, _ := newPair[*big](t)
 	require.NoError(t, tx.Send(&big{}))
 	rx.Close()
 	_, err := rx.TryRecv()
@@ -219,7 +224,7 @@ func TestReceiverCloseAfterSendDropsValue(t *testing.T) {
 }
 
 func TestChanDelivery(t *testing.T) {
-	tx, rx := oneshot.New[int]()
+	tx, rx, _ := newPair[int](t)
 	c := rx.Chan()
 	go func() { _ = tx.Send(123) }()
 	v, ok := <-c
@@ -230,13 +235,13 @@ func TestChanDelivery(t *testing.T) {
 }
 
 func TestChanIsStable(t *testing.T) {
-	_, rx := oneshot.New[int]()
+	_, rx, _ := newPair[int](t)
 	c := rx.Chan()
 	assert.True(t, c == rx.Chan(), "Chan() returned different channels on repeated calls")
 }
 
 func TestChanClosedOnSenderClose(t *testing.T) {
-	tx, rx := oneshot.New[int]()
+	tx, rx, _ := newPair[int](t)
 	c := rx.Chan()
 	tx.Close()
 	select {
@@ -249,7 +254,7 @@ func TestChanClosedOnSenderClose(t *testing.T) {
 
 func TestSendRecvCloseRace(t *testing.T) {
 	for i := 0; i < 200; i++ {
-		tx, rx := oneshot.New[int]()
+		tx, rx, _ := newPair[int](t)
 		var wg sync.WaitGroup
 		wg.Add(2)
 		var sendErr error
@@ -266,4 +271,36 @@ func TestSendRecvCloseRace(t *testing.T) {
 			assert.ErrorIs(t, sendErr, gochan.ErrClosed)
 		}
 	}
+}
+
+func TestKillBeforeSendUnblocksRecv(t *testing.T) {
+	_, rx, kill := newPair[int](t)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		kill()
+	}()
+	_, err := rx.Recv()
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+}
+
+func TestKillAfterSendDropsValue(t *testing.T) {
+	tx, rx, kill := newPair[int](t)
+	require.NoError(t, tx.Send(99))
+	kill()
+	_, err := rx.Recv()
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+}
+
+func TestKillCausesSendErrClosed(t *testing.T) {
+	tx, _, kill := newPair[int](t)
+	kill()
+	assert.ErrorIs(t, tx.Send(1), gochan.ErrClosed)
+}
+
+func TestKillIdempotent(t *testing.T) {
+	_, _, kill := oneshot.New[int]()
+	assert.NotPanics(t, func() {
+		kill()
+		kill()
+	})
 }

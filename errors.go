@@ -6,7 +6,7 @@ package gochan
 import "errors"
 
 var (
-	ErrClosed = errors.New("chans: channel closed")
-	ErrFull   = errors.New("chans: channel full")
-	ErrEmpty  = errors.New("chans: channel empty")
+	ErrClosed = errors.New("gochan: channel closed")
+	ErrFull   = errors.New("gochan: channel full")
+	ErrEmpty  = errors.New("gochan: channel empty")
 )

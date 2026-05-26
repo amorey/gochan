@@ -1,6 +1,8 @@
 # gochan
 
-*gochan is a small library that implements multiple channel architectures for Go, inspired by Rust*
+*A small library that implements multiple channel architectures for Go, inspired by Rust*
+
+<img width="435" alt="gochan" src="https://github.com/user-attachments/assets/55534faa-494e-4038-a093-6c37f7040693" />
 
 ## Introduction
 

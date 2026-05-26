@@ -61,9 +61,11 @@ for {
 **SPMC** — distribute work from one producer across a pool of workers:
 
 ```go
-tx, rx := spmc.NewBounded[Job](128)
+tx := spmc.NewBounded[Job](128)
 for i := 0; i < workers; i++ {
+    rx := tx.Consumer()
     go func() {
+        defer rx.Close()
         for {
             job, err := rx.Recv()
             if err != nil { return }
@@ -78,12 +80,11 @@ tx.Close()
 **MPSC** — fan-in workers to a single collector:
 
 ```go
-tx, rx := mpsc.NewBounded[Event](256)
+rx := mpsc.NewBounded[Event](256)
 for i := 0; i < n; i++ {
-    s := tx.Clone()
+    s := rx.Producer()
     go func() { defer s.Close(); produce(s) }()
 }
-tx.Close() // drop the original handle
 for {
     ev, err := rx.Recv()
     if err != nil { break }
@@ -163,9 +164,9 @@ Each package exposes one or two constructors, some with explicit `capacity` argu
 | ------------------------ | ------------ | ---------------- | -------------------------------------------- |
 | `oneshot.New[T]()`       | —            | —                | Single value, single delivery                |
 | `spsc.NewBounded[T](n)`  | yes          | yes (rendezvous) | FIFO queue, one sender and one receiver      |
-| `spmc.NewBounded[T](n)`  | yes          | yes (rendezvous) | One sender, items load-balanced to receivers |
-| `mpsc.NewBounded[T](n)`  | yes          | yes (rendezvous) | Fan-in from many senders to one receiver     |
-| `mpsc.NewUnbounded[T]()` | —            | —                | Grows without bound                          |
+| `spmc.NewBounded[T](n)`  | yes          | yes (rendezvous) | One sender, items load-balanced to receivers spawned via `tx.Consumer()` |
+| `mpsc.NewBounded[T](n)`  | yes          | yes (rendezvous) | Fan-in to one receiver from many senders spawned via `rx.Producer()` |
+| `mpsc.NewUnbounded[T]()` | —            | —                | Same shape as `NewBounded`, but grows without bound |
 | `mpmc.NewBounded[T](n)`  | yes          | yes (rendezvous) | Shared queue, any sender to any receiver     |
 | `broadcast.New[T](n)`    | yes          | no (panics)      | Ring buffer size; overwrites on lag          |
 | `watch.New[T](initial)`  | —            | —                | Single slot, always holds the latest value   |
@@ -174,7 +175,7 @@ Each package exposes one or two constructors, some with explicit `capacity` argu
 
 ### Common interface
 
-Every channel type implements the same two interfaces, so swapping architectures is easy:
+Every channel type implements the same two interfaces to make switching between architectures easier:
 
 ```go
 type Sender[T any] interface {
@@ -362,7 +363,177 @@ func (rx *Receiver[T]) Close()
 
 #### spmc
 
+A single-producer, multi-consumer FIFO queue. One `Sender` feeds values into
+a bounded buffer that is drained by any number of `Receiver`s, with each
+value delivered to exactly one receiver. Capacity behaves exactly like a Go
+buffered channel: `NewBounded[T](0)` is a rendezvous channel,
+`NewBounded[T](n)` allows `n` queued values before `Send` blocks.
+
+Typical uses: distributing work items to a pool of workers from a single
+dispatcher goroutine, parallelizing a CPU-bound pipeline stage, fanning a
+single input stream out across N consumers without duplication.
+
+Unlike `broadcast`, every value goes to *one* receiver, not all of them —
+`spmc` is load distribution, not fan-out.
+
+**Constructor**
+
+```go
+func NewBounded[T any](capacity int) *Sender[T]
+```
+
+<dl>
+  <dt><code>NewBounded[T](capacity)</code></dt>
+  <dd>Creates a fresh spmc sender backed by a buffered Go channel of the given <code>capacity</code>. <code>capacity == 0</code> yields a rendezvous channel where <code>Send</code> blocks until some receiver is ready. <code>capacity &lt; 0</code> panics. The constructor returns only a sender; receivers are obtained from it via <a href="#spmc-consumer"><code>tx.Consumer()</code></a>. A freshly constructed spmc has no receivers, so <code>Send</code> will block (or <code>TrySend</code> will report <code>ErrFull</code>) until at least one <code>Consumer</code> is registered.</dd>
+</dl>
+
+**Sender**
+
+```go
+func (tx *Sender[T]) Consumer() *Receiver[T]
+func (tx *Sender[T]) Send(v T) error
+func (tx *Sender[T]) TrySend(v T) error
+func (tx *Sender[T]) SendContext(ctx context.Context, v T) error
+func (tx *Sender[T]) Close()
+```
+
+<dl>
+  <dt id="spmc-consumer"><code>Consumer() *Receiver[T]</code></dt>
+  <dd>Returns a new receiver bound to the shared queue. Use this to add workers to the consumer pool. Each returned receiver has its own independent <code>Close</code> state but shares the queue and sender-close signal with every other receiver. Safe to call concurrently. If every previously-registered receiver has already been closed (so the sender has already observed <code>ErrClosed</code>), the returned receiver is pre-closed.</dd>
+  <dt><code>Send(v) error</code></dt>
+  <dd>Enqueues <code>v</code>, blocking while the buffer is full and no receiver is ready to consume it. Returns <code>ErrClosed</code> if the sender has been closed or every receiver has been closed; on <code>ErrClosed</code> the value is dropped.</dd>
+  <dt><code>TrySend(v) error</code></dt>
+  <dd>Non-blocking. Returns <code>ErrFull</code> if the buffer is full and no receiver is currently parked on a recv, <code>ErrClosed</code> if closed, or <code>nil</code> on success.</dd>
+  <dt><code>SendContext(ctx, v) error</code></dt>
+  <dd>Like <code>Send</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled before the value is enqueued. The value is dropped on cancellation.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Closes the sender. Already-queued values remain receivable; receivers drain them in order before observing <code>ErrClosed</code>. Further <code>Send</code> calls return <code>ErrClosed</code>. Idempotent. Intended to be called by the single producer — spmc does not synchronize concurrent callers on the sender side (though <code>Consumer</code> is safe to call from any goroutine).</dd>
+</dl>
+
+**Receiver**
+
+```go
+func (rx *Receiver[T]) Recv() (T, error)
+func (rx *Receiver[T]) TryRecv() (T, error)
+func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error)
+func (rx *Receiver[T]) Chan() <-chan T
+func (rx *Receiver[T]) Close()
+```
+
+<dl>
+  <dt><code>Recv() (T, error)</code></dt>
+  <dd>Blocks until a value is available to this receiver. Returns the next value in the shared FIFO, or <code>ErrClosed</code> if the buffer is empty and the sender has closed, or this receiver is closed. Each enqueued value is delivered to exactly one receiver; competing receivers are scheduled by the Go runtime.</dd>
+  <dt><code>TryRecv() (T, error)</code></dt>
+  <dd>Non-blocking. Returns the next value if one is buffered, <code>ErrEmpty</code> if the buffer is empty but the sender is still open, or <code>ErrClosed</code> if the buffer is empty and closed (or this receiver is closed).</dd>
+  <dt><code>RecvContext(ctx) (T, error)</code></dt>
+  <dd>Like <code>Recv</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled first. Cancellation does <em>not</em> close this receiver; subsequent calls remain valid.</dd>
+  <dt><code>Chan() &lt;-chan T</code></dt>
+  <dd>Returns the underlying receive-only channel, suitable for use in <code>select</code>. The channel is shared across all receivers in the same spmc — values delivered on it count against the single shared queue, so two receivers selecting on <code>Chan()</code> simultaneously still see each value only once. Closed when the sender closes and the buffer drains. Closing this receiver does <em>not</em> close the channel; use <code>Recv</code>/<code>TryRecv</code> if you need that signal. Repeated calls return the same channel.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Closes this receiver only. Other receivers and the sender are unaffected — they continue to consume and produce. Subsequent <code>Recv</code>/<code>TryRecv</code>/<code>RecvContext</code> calls on this handle return <code>ErrClosed</code>. The sender only observes <code>ErrClosed</code> when <em>every</em> receiver has been closed. Idempotent.</dd>
+</dl>
+
+**Semantics**
+
+<dl>
+  <dt>Single producer / multi consumer</dt>
+  <dd>Exactly one goroutine should call <code>Send</code>/<code>Close</code> on the sender. Any number of goroutines may each hold their own <code>*Receiver[T]</code> (obtained from <code>tx.Consumer()</code>) and call <code>Recv</code>/<code>Close</code> on it. The implementation does not synchronize concurrent callers on the <em>same</em> receiver handle — call <code>Consumer</code> once per worker.</dd>
+  <dt>Each value to exactly one receiver</dt>
+  <dd>Values are <em>not</em> broadcast. A <code>Send</code> deposits one value into the shared queue, and the next <code>Recv</code> on any receiver removes it. Choice of receiver is non-deterministic and not guaranteed to be fair — it follows Go's channel-receive scheduling.</dd>
+  <dt>FIFO ordering across the queue</dt>
+  <dd>The queue itself preserves send order, but because work is split across multiple consumers, any single receiver only sees a subsequence of the sends — interleaved with the work other receivers grabbed.</dd>
+  <dt>Sender close drains</dt>
+  <dd>Closing the sender does not discard already-buffered values; receivers drain them in order before any of them observes <code>ErrClosed</code>. Closing a single receiver, by contrast, only affects that receiver; the queue keeps flowing through the remaining ones.</dd>
+  <dt>All receivers closed ⇒ sender sees ErrClosed</dt>
+  <dd>If every receiver has been closed, the sender's next <code>Send</code>/<code>TrySend</code>/<code>SendContext</code> returns <code>ErrClosed</code> and the value is dropped. This is how a sender notices that there is nobody left to receive its work.</dd>
+  <dt>Backpressure</dt>
+  <dd>A bounded buffer applies natural backpressure: when full, <code>Send</code> blocks until some receiver makes room. Use <code>capacity == 0</code> for strict rendezvous handoff with no buffering — a useful pattern when you want producers to slow down to exactly the rate of the slowest combined consumer throughput.</dd>
+</dl>
+
 #### mpsc
+
+A multiple-producer, single-consumer FIFO queue. Any number of `Sender` handles feed values into a shared queue drained by one `Receiver`. Two flavors are provided: a bounded buffer (`NewBounded`) that applies backpressure, and an unbounded buffer (`NewUnbounded`) that grows as needed.
+
+Typical uses: fan-in of events from many worker goroutines into a single
+aggregator, collecting results from a scatter of parallel tasks, funnelling
+log/metric/event streams to one writer.
+
+**Constructors**
+
+```go
+func NewBounded[T any](capacity int) *Receiver[T]
+func NewUnbounded[T any]() *Receiver[T]
+```
+
+<dl>
+  <dt><code>NewBounded[T](capacity)</code></dt>
+  <dd>Creates a fresh mpsc receiver backed by a buffered Go channel of the given <code>capacity</code>. <code>capacity == 0</code> yields a rendezvous channel where every <code>Send</code> blocks until the receiver is ready. <code>capacity &lt; 0</code> panics. Bounded variants give you natural backpressure: when the buffer is full, producers wait.</dd>
+  <dt><code>NewUnbounded[T]()</code></dt>
+  <dd>Creates a fresh mpsc receiver with an unbounded internal queue. <code>Send</code> never blocks on capacity (only on closed state). Use this when bursts are unavoidable and bounded backpressure would deadlock you — but watch for memory growth if producers can outrun the consumer indefinitely. <code>TrySend</code> never returns <code>ErrFull</code>.</dd>
+</dl>
+
+Both constructors return only a receiver; senders are obtained from it via <a href="#mpsc-producer"><code>rx.Producer()</code></a>. A freshly constructed mpsc has no senders, so <code>Recv</code> will block (or <code>TryRecv</code> will report <code>ErrEmpty</code>) until at least one producer is registered and sends a value.
+
+**Receiver**
+
+```go
+func (rx *Receiver[T]) Producer() *Sender[T]
+func (rx *Receiver[T]) Recv() (T, error)
+func (rx *Receiver[T]) TryRecv() (T, error)
+func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error)
+func (rx *Receiver[T]) Chan() <-chan T
+func (rx *Receiver[T]) Close()
+```
+
+<dl>
+  <dt id="mpsc-producer"><code>Producer() *Sender[T]</code></dt>
+  <dd>Returns a new sender bound to the shared queue. Use this to add producers to the fan-in. Each returned sender has its own independent <code>Close</code> state but shares the queue and receiver-close signal with every other sender. Safe to call concurrently. If the receiver has been closed (or every previously-registered sender has been closed and the buffer has drained), the returned sender is pre-closed.</dd>
+  <dt><code>Recv() (T, error)</code></dt>
+  <dd>Blocks until a value is available. Returns the next value in FIFO order, or <code>ErrClosed</code> if the buffer is empty and every sender has closed, or this receiver is closed.</dd>
+  <dt><code>TryRecv() (T, error)</code></dt>
+  <dd>Non-blocking. Returns the next value if one is buffered, <code>ErrEmpty</code> if the buffer is empty but at least one sender is still open, or <code>ErrClosed</code> if the buffer is empty and all senders are closed (or the receiver is closed).</dd>
+  <dt><code>RecvContext(ctx) (T, error)</code></dt>
+  <dd>Like <code>Recv</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled first. Cancellation does <em>not</em> close the receiver; subsequent calls remain valid.</dd>
+  <dt><code>Chan() &lt;-chan T</code></dt>
+  <dd>Returns the underlying receive-only channel, suitable for use in <code>select</code>. Closed when every sender has closed and the buffer has drained. Closing the receiver does <em>not</em> close this channel — use <code>Recv</code>/<code>TryRecv</code> if you need that signal. Repeated calls return the same channel.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Closes the receiver. Pending or future <code>Send</code> calls on any sender return <code>ErrClosed</code>, and subsequent <code>Recv</code>/<code>TryRecv</code>/<code>RecvContext</code> calls return <code>ErrClosed</code>. Any values still buffered are abandoned. Idempotent.</dd>
+</dl>
+
+**Sender**
+
+```go
+func (tx *Sender[T]) Send(v T) error
+func (tx *Sender[T]) TrySend(v T) error
+func (tx *Sender[T]) SendContext(ctx context.Context, v T) error
+func (tx *Sender[T]) Close()
+```
+
+<dl>
+  <dt><code>Send(v) error</code></dt>
+  <dd>Enqueues <code>v</code>. For bounded mpsc, blocks while the buffer is full; for unbounded mpsc, returns as soon as the value is appended. Returns <code>ErrClosed</code> if this sender has been closed or the receiver has been closed; on <code>ErrClosed</code> the value is dropped.</dd>
+  <dt><code>TrySend(v) error</code></dt>
+  <dd>Non-blocking. Returns <code>ErrFull</code> if a bounded buffer is full, <code>ErrClosed</code> if closed, or <code>nil</code> on success. For unbounded mpsc, <code>ErrFull</code> is never returned.</dd>
+  <dt><code>SendContext(ctx, v) error</code></dt>
+  <dd>Like <code>Send</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled before the value is enqueued. The value is dropped on cancellation. For unbounded mpsc, cancellation effectively only matters at entry, since the enqueue itself doesn't block.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Closes this sender only. Other senders continue to produce. Subsequent <code>Send</code>/<code>TrySend</code>/<code>SendContext</code> calls on this handle return <code>ErrClosed</code>. The receiver only observes <code>ErrClosed</code> (after draining) when <em>every</em> sender has been closed. Idempotent.</dd>
+</dl>
+
+**Semantics**
+
+<dl>
+  <dt>Multi producer / single consumer</dt>
+  <dd>Any number of goroutines may each hold their own <code>*Sender[T]</code> (obtained from <code>rx.Producer()</code>) and call <code>Send</code>/<code>Close</code> on it. Exactly one goroutine should call <code>Recv</code>/<code>Close</code> on the receiver. The implementation does not synchronize concurrent callers on the <em>same</em> sender handle — call <code>Producer</code> once per producer goroutine.</dd>
+  <dt>FIFO across the queue, not across producers</dt>
+  <dd>The queue itself preserves the order in which sends arrive at the underlying channel, but the relative ordering of sends from <em>different</em> producers is not defined — it depends on scheduling. Sends from a single producer remain in order with respect to each other.</dd>
+  <dt>All senders closed ⇒ receiver drains, then sees ErrClosed</dt>
+  <dd>The receiver does not observe <code>ErrClosed</code> until both (a) every sender obtained from <code>Producer</code> has been closed and (b) the buffer is empty. If you spawn N producers, you must close all N — a forgotten <code>Close</code> on any one of them leaves the receiver waiting forever for an EOF that never arrives.</dd>
+  <dt>Receiver close stops everything</dt>
+  <dd>Closing the receiver immediately fails every pending and future <code>Send</code> across all senders with <code>ErrClosed</code> and abandons any buffered values.</dd>
+  <dt>Bounded vs unbounded backpressure</dt>
+  <dd><code>NewBounded</code> applies natural backpressure: when full, <code>Send</code> blocks until the consumer makes room. <code>NewUnbounded</code> trades that backpressure for memory growth — appropriate when bursts are bounded by upstream logic, inappropriate when producers can outrun the consumer indefinitely.</dd>
+</dl>
 
 #### mpmc
 

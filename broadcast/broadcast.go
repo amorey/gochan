@@ -71,11 +71,12 @@
 // start at "now" and don't see them. This package therefore never
 // returns [gochan.ErrNotReady].
 //
-// Hub close-all. [Hub.Close] closes the sender and every live receiver.
-// Recv-style callers can drain anything they had not yet consumed at
-// the time of close (subject to lag) before seeing [gochan.ErrClosed];
-// Chan consumers see the channel close after their drain. The sender's
-// view of close is immediate.
+// Hub close-all. [Hub.Close] closes the sender and every live receiver
+// immediately. Already-buffered values are not drained: the next Recv
+// returns [gochan.ErrClosed], and Chan feeder goroutines unblock and
+// close their channel without delivering remaining ring contents. Use
+// [Sender.Close] instead if you want subscribers to finish consuming
+// already-published values before seeing close.
 //
 // # Patterns
 //

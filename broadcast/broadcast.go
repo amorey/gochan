@@ -158,7 +158,7 @@ func (h *Hub[T]) Receiver() gochan.Receiver[T] {
 		pos:  s.writePos.Load(),
 		done: chancore.NewCloseOnce(),
 	}
-	if s.hubClosed.Load() {
+	if s.hubClosed.Load() || s.txClosed.Load() {
 		rx.done.Close()
 		return rx
 	}

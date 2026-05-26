@@ -89,7 +89,7 @@ func (s *BufferedSend[T]) TrySend(v T) error {
 		select {
 		case <-s.Ready.Done():
 		default:
-			return gochan.ErrFull
+			return gochan.ErrNotReady
 		}
 	}
 	s.SendLock.Lock()

@@ -241,12 +241,15 @@ All three are idempotent. The close-all inherits the sender's close discipline �
 A small set of sentinel errors is shared across all packages:
 
 ```go
-var ErrClosed = errors.New("chans: channel closed")
-var ErrFull   = errors.New("chans: channel full")
-var ErrEmpty  = errors.New("chans: channel empty")
+var ErrClosed   = errors.New("chans: channel closed")
+var ErrFull     = errors.New("chans: channel full")
+var ErrEmpty    = errors.New("chans: channel empty")
+var ErrNotReady = errors.New("chans: no counterparty registered")
 
 type ErrLagged struct{ Skipped uint64 }  // broadcast only
 ```
+
+`ErrNotReady` is returned by `TrySend` on packages with multi-side fan-out (`spmc`, `mpmc`) before any receiver has been registered, and by `TryRecv` on multi-side fan-in (`mpsc`, `mpmc`) before any sender has been registered. It distinguishes "the other side hasn't shown up yet" (a lifecycle/config condition) from `ErrFull` / `ErrEmpty` (transient buffer pressure). After the first registration on each side the regular `ErrFull` / `ErrEmpty` semantics apply.
 
 `ErrLagged` is specific to `broadcast` and signals that a slow receiver has fallen behind the ring buffer; the receiver is still usable and will resume from the oldest still-buffered value.
 
@@ -461,7 +464,7 @@ func (tx *Sender[T]) Close()
   <dt><code>Send(v) error</code></dt>
   <dd>Enqueues <code>v</code>, blocking while the buffer is full and no receiver is ready to consume it. Returns <code>ErrClosed</code> if the sender has been closed, every receiver has been closed, or the hub has been closed; on <code>ErrClosed</code> the value is dropped.</dd>
   <dt><code>TrySend(v) error</code></dt>
-  <dd>Non-blocking. Returns <code>ErrFull</code> if the buffer is full and no receiver is currently parked on a recv, <code>ErrClosed</code> if closed, or <code>nil</code> on success.</dd>
+  <dd>Non-blocking. Returns <code>ErrNotReady</code> if no receiver has yet been registered, <code>ErrFull</code> if the buffer is full and no receiver is currently parked on a recv, <code>ErrClosed</code> if closed, or <code>nil</code> on success.</dd>
   <dt><code>SendContext(ctx, v) error</code></dt>
   <dd>Like <code>Send</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled before the value is enqueued. The value is dropped on cancellation.</dd>
   <dt><code>Close()</code></dt>
@@ -562,7 +565,7 @@ func (rx *Receiver[T]) Close()
   <dt><code>Recv() (T, error)</code></dt>
   <dd>Blocks until a value is available. Returns the next value in FIFO order, or <code>ErrClosed</code> if the buffer is empty and every sender has closed, this receiver is closed, or the hub has been closed.</dd>
   <dt><code>TryRecv() (T, error)</code></dt>
-  <dd>Non-blocking. Returns the next value if one is buffered, <code>ErrEmpty</code> if the buffer is empty but at least one sender is still open, or <code>ErrClosed</code> if the buffer is empty and all senders are closed (or the receiver/hub is closed).</dd>
+  <dd>Non-blocking. Returns the next value if one is buffered, <code>ErrNotReady</code> if no sender has yet been registered, <code>ErrEmpty</code> if the buffer is empty but at least one sender is still open, or <code>ErrClosed</code> if the buffer is empty and all senders are closed (or the receiver/hub is closed).</dd>
   <dt><code>RecvContext(ctx) (T, error)</code></dt>
   <dd>Like <code>Recv</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled first. Cancellation does <em>not</em> close the receiver; subsequent calls remain valid.</dd>
   <dt><code>Chan() &lt;-chan T</code></dt>
@@ -609,6 +612,114 @@ func (tx *Sender[T]) Close()
 </dl>
 
 #### mpmc
+
+A multi-producer, multi-consumer FIFO queue. Any number of `Sender` handles
+feed values into a bounded buffer drained by any number of `Receiver`
+handles, with each value delivered to exactly one receiver. Capacity behaves
+exactly like a Go buffered channel: `New[T](0)` is a rendezvous channel,
+`New[T](n)` allows `n` queued values before `Send` blocks.
+
+Typical uses: work queues with both elastic producer and consumer pools,
+ingestion pipelines where N publishers feed M workers, generic job/task
+queues without a designated dispatcher.
+
+Like `spmc`, every value goes to *one* receiver, not all of them — `mpmc`
+is load distribution across the consumer pool, not fan-out. If you need
+fan-out, use `broadcast`.
+
+**Constructor**
+
+```go
+func New[T any](capacity int) *Hub[T]
+```
+
+<dl>
+  <dt><code>New[T](capacity)</code></dt>
+  <dd>Creates a fresh mpmc hub backed by a buffered Go channel of the given <code>capacity</code>. <code>capacity == 0</code> yields a rendezvous channel where <code>Send</code> blocks until some receiver is ready. <code>capacity &lt; 0</code> panics.</dd>
+</dl>
+
+A freshly constructed mpmc hub has neither senders nor receivers. <code>Send</code> blocks (and <code>TrySend</code> reports <code>ErrFull</code>) until at least one <code>Receiver</code> is registered via <a href="#mpmc-receiver"><code>hub.Receiver()</code></a>; <code>Recv</code> blocks (and <code>TryRecv</code> reports <code>ErrEmpty</code>) until at least one <code>Sender</code> is registered via <a href="#mpmc-sender"><code>hub.Sender()</code></a> and sends a value. The "all senders closed ⇒ <code>ErrClosed</code>" and "all receivers closed ⇒ <code>ErrClosed</code>" rules only kick in after each side has had at least one registration — a fresh hub is not implicitly closed.
+
+**Hub**
+
+```go
+func (h *Hub[T]) Sender()   gochan.Sender[T]
+func (h *Hub[T]) Receiver() gochan.Receiver[T]
+func (h *Hub[T]) Close()
+```
+
+<dl>
+  <dt id="mpmc-sender"><code>Sender() gochan.Sender[T]</code></dt>
+  <dd>Returns a new sender bound to the shared queue. Use this to add producers to the fan-in. Each returned sender has its own independent <code>Close</code> state but shares the queue and receiver-close signal with every other sender. Safe to call concurrently. If the hub has been closed (explicitly via <code>Hub.Close</code>, implicitly because every previously-registered sender has already closed, or because every previously-registered receiver has already closed) the returned handle is pre-closed and reports <code>ErrClosed</code> on use.</dd>
+  <dt id="mpmc-receiver"><code>Receiver() gochan.Receiver[T]</code></dt>
+  <dd>Returns a new receiver bound to the shared queue. Use this to add workers to the consumer pool. Each returned receiver has its own independent <code>Close</code> state but shares the queue and sender-close signal with every other receiver. Safe to call concurrently. If the hub has been closed (or every previously-registered receiver has already been closed, or every previously-registered sender has already closed and the buffer is empty) the returned handle is pre-closed and reports <code>ErrClosed</code> on use.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Equivalent to calling <code>Close</code> on every live receiver and on every live sender (receivers first, so in-flight <code>Send</code>s escape via the dead signal before the underlying channel is closed). For <code>Recv</code>-style callers buffered values are abandoned; <code>Chan</code> consumers can drain them before seeing channel-closed. Future <code>Sender</code> and <code>Receiver</code> calls return pre-closed handles. Idempotent. Inherits the senders' close discipline — don't call concurrently with an active <code>Send</code> on any sender from another goroutine.</dd>
+</dl>
+
+**Sender**
+
+```go
+func (tx *Sender[T]) Send(v T) error
+func (tx *Sender[T]) TrySend(v T) error
+func (tx *Sender[T]) SendContext(ctx context.Context, v T) error
+func (tx *Sender[T]) Close()
+```
+
+<dl>
+  <dt><code>Send(v) error</code></dt>
+  <dd>Enqueues <code>v</code>, blocking while the buffer is full and (until the first receiver registers) while no receiver exists. Returns <code>ErrClosed</code> if this sender has been closed, every receiver has been closed, or the hub has been closed; on <code>ErrClosed</code> the value is dropped.</dd>
+  <dt><code>TrySend(v) error</code></dt>
+  <dd>Non-blocking. Returns <code>ErrNotReady</code> if no receiver has yet been registered, <code>ErrFull</code> if the buffer is full and no receiver is currently parked, <code>ErrClosed</code> if closed, or <code>nil</code> on success.</dd>
+  <dt><code>SendContext(ctx, v) error</code></dt>
+  <dd>Like <code>Send</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled before the value is enqueued. The value is dropped on cancellation.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Closes this sender only. Other senders continue to produce. Subsequent <code>Send</code>/<code>TrySend</code>/<code>SendContext</code> calls on this handle return <code>ErrClosed</code>. Receivers only observe <code>ErrClosed</code> (after draining) when <em>every</em> sender has been closed. Idempotent. Intended to be called by the producer goroutine that owns this sender — mpmc does not synchronize concurrent callers on the same sender handle.</dd>
+</dl>
+
+**Receiver**
+
+```go
+func (rx *Receiver[T]) Recv() (T, error)
+func (rx *Receiver[T]) TryRecv() (T, error)
+func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error)
+func (rx *Receiver[T]) Chan() <-chan T
+func (rx *Receiver[T]) Close()
+```
+
+<dl>
+  <dt><code>Recv() (T, error)</code></dt>
+  <dd>Blocks until a value is available to this receiver. Returns the next value in the shared FIFO, or <code>ErrClosed</code> if the buffer is empty and every sender has closed, this receiver is closed, or the hub has been closed. Each enqueued value is delivered to exactly one receiver; competing receivers are scheduled by the Go runtime.</dd>
+  <dt><code>TryRecv() (T, error)</code></dt>
+  <dd>Non-blocking. Returns the next value if one is buffered, <code>ErrNotReady</code> if no sender has yet been registered, <code>ErrEmpty</code> if the buffer is empty but at least one sender is still open, or <code>ErrClosed</code> if the buffer is empty and all senders are closed (or this receiver/the hub is closed).</dd>
+  <dt><code>RecvContext(ctx) (T, error)</code></dt>
+  <dd>Like <code>Recv</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled first. Cancellation does <em>not</em> close this receiver; subsequent calls remain valid.</dd>
+  <dt><code>Chan() &lt;-chan T</code></dt>
+  <dd>Returns the underlying receive-only channel, suitable for use in <code>select</code>. The channel is shared across all receivers in the same hub — values delivered on it count against the single shared queue, so two receivers selecting on <code>Chan()</code> simultaneously still see each value only once. Closed when every sender has closed (directly or via <code>hub.Close()</code>) and the buffer drains. Closing <em>this</em> receiver does <em>not</em> close the channel; use <code>Recv</code>/<code>TryRecv</code> if you need that signal. Repeated calls return the same channel.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Closes this receiver only. Other receivers and the senders are unaffected — they continue to consume and produce. Subsequent <code>Recv</code>/<code>TryRecv</code>/<code>RecvContext</code> calls on this handle return <code>ErrClosed</code>. Senders observe <code>ErrClosed</code> once <em>every</em> receiver has been closed (or the hub itself has been closed). Idempotent.</dd>
+</dl>
+
+**Semantics**
+
+<dl>
+  <dt>Multi producer / multi consumer</dt>
+  <dd>Any number of goroutines may each hold their own <code>*Sender[T]</code> (obtained from <code>hub.Sender()</code>) and call <code>Send</code>/<code>Close</code> on it; any number may each hold their own <code>*Receiver[T]</code> (obtained from <code>hub.Receiver()</code>) and call <code>Recv</code>/<code>Close</code> on it. The implementation does not synchronize concurrent callers on the <em>same</em> sender or receiver handle — call <code>hub.Sender()</code> once per producer goroutine and <code>hub.Receiver()</code> once per worker.</dd>
+  <dt>Each value to exactly one receiver</dt>
+  <dd>Values are <em>not</em> broadcast. A <code>Send</code> deposits one value into the shared queue, and the next <code>Recv</code> on any receiver removes it. Choice of receiver is non-deterministic and not guaranteed to be fair — it follows Go's channel-receive scheduling.</dd>
+  <dt>FIFO across the queue, not across producers or consumers</dt>
+  <dd>The queue itself preserves the order in which sends arrive at the underlying channel. Sends from a single producer remain in order with respect to each other, but the relative ordering of sends from <em>different</em> producers depends on scheduling. Any single receiver only sees a subsequence of the sends — interleaved with the work other receivers grabbed.</dd>
+  <dt>Empty-hub gating</dt>
+  <dd>A freshly constructed hub has neither senders nor receivers registered. <code>Send</code> blocks until <code>hub.Receiver()</code> has been called at least once; <code>Recv</code> blocks until <code>hub.Sender()</code> has been called at least once and a value has been sent. The implicit-close rules below only apply after each side has had at least one registration.</dd>
+  <dt>All senders closed ⇒ receivers drain, then see ErrClosed</dt>
+  <dd>Once at least one sender has been registered, every receiver observes <code>ErrClosed</code> when both (a) every sender obtained from <code>hub.Sender()</code> has been closed and (b) the buffer is empty. If you spawn N producers, you must close all N — a forgotten <code>Close</code> on any one of them leaves receivers waiting forever for an EOF that never arrives.</dd>
+  <dt>All receivers closed ⇒ senders see ErrClosed</dt>
+  <dd>Once at least one receiver has been registered, every sender's next <code>Send</code>/<code>TrySend</code>/<code>SendContext</code> returns <code>ErrClosed</code> if every receiver has been closed, and any buffered values are abandoned for <code>Recv</code>-style callers. This is how senders notice that nobody is left to do the work.</dd>
+  <dt>Backpressure</dt>
+  <dd>A bounded buffer applies natural backpressure: when full, <code>Send</code> blocks until some receiver makes room. Use <code>capacity == 0</code> for strict rendezvous handoff with no buffering.</dd>
+  <dt>Hub close-all</dt>
+  <dd><code>Hub.Close()</code> calls <code>Close</code> on every live sender and every live receiver. Recv-style callers see <code>ErrClosed</code> immediately; <code>Chan</code> consumers drain remaining values before seeing channel-closed.</dd>
+</dl>
 
 #### broadcast
 

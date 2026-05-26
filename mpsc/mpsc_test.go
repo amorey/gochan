@@ -238,10 +238,10 @@ func TestReceiverCloseSendersSeeClosed(t *testing.T) {
 	assert.ErrorIs(t, tx.SendContext(context.Background(), 1), gochan.ErrClosed)
 }
 
-func TestTryRecvFreshHubReportsEmpty(t *testing.T) {
+func TestTryRecvFreshHubReportsNotReady(t *testing.T) {
 	_, rx := newHubRx[int](t, 4)
 	_, err := rx.TryRecv()
-	assert.ErrorIs(t, err, gochan.ErrEmpty)
+	assert.ErrorIs(t, err, gochan.ErrNotReady)
 }
 
 func TestRecvContextBlocksOnFreshHub(t *testing.T) {

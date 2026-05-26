@@ -34,11 +34,11 @@ type shared[T any] struct {
 	chMu     sync.RWMutex
 	chClosed atomic.Bool
 
-	dead *chancore.CloseOnce
+	dead    *chancore.CloseOnce
+	txReady *chancore.CloseOnce // closed when the first Sender is registered
 
 	mu      sync.Mutex
-	txCount int  // number of still-open senders
-	txEver  bool // at least one sender has ever been registered
+	txCount int // number of still-open senders
 
 	send chancore.BufferedSend[T]
 	recv chancore.BufferedRecv[T]
@@ -79,8 +79,9 @@ func New[T any](capacity int) *Hub[T] {
 		panic("mpsc: negative capacity")
 	}
 	s := &shared[T]{
-		ch:   make(chan T, capacity),
-		dead: chancore.NewCloseOnce(),
+		ch:      make(chan T, capacity),
+		dead:    chancore.NewCloseOnce(),
+		txReady: chancore.NewCloseOnce(),
 	}
 	s.send = chancore.BufferedSend[T]{
 		Ch:       s.ch,
@@ -89,8 +90,9 @@ func New[T any](capacity int) *Hub[T] {
 		SendLock: s.chMu.RLocker(),
 	}
 	s.recv = chancore.BufferedRecv[T]{
-		Ch:   s.ch,
-		Dead: s.dead.Done(),
+		Ch:    s.ch,
+		Dead:  s.dead.Done(),
+		Ready: s.txReady,
 	}
 	h := &Hub[T]{s: s}
 	h.rx = &Receiver[T]{s: s}
@@ -109,11 +111,11 @@ func (h *Hub[T]) Sender() gochan.Sender[T] {
 	s := h.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.dead.IsClosed() || s.chClosed.Load() || (s.txEver && s.txCount == 0) {
+	if s.dead.IsClosed() || s.chClosed.Load() || (s.txReady.IsClosed() && s.txCount == 0) {
 		return &Sender[T]{s: s, closed: true}
 	}
 	s.txCount++
-	s.txEver = true
+	s.txReady.Close()
 	return &Sender[T]{s: s}
 }
 

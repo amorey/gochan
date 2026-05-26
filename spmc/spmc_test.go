@@ -210,10 +210,10 @@ func TestAllReceiversClosedUnblocksPendingSend(t *testing.T) {
 	assert.ErrorIs(t, <-errCh, gochan.ErrClosed)
 }
 
-func TestTrySendWithoutConsumerReportsFull(t *testing.T) {
+func TestTrySendWithoutConsumerReportsNotReady(t *testing.T) {
 	h, tx := newHubTx[int](t, 4)
-	assert.ErrorIs(t, tx.TrySend(1), gochan.ErrFull)
-	assert.ErrorIs(t, tx.TrySend(2), gochan.ErrFull)
+	assert.ErrorIs(t, tx.TrySend(1), gochan.ErrNotReady)
+	assert.ErrorIs(t, tx.TrySend(2), gochan.ErrNotReady)
 
 	rx := newRx(t, h)
 	require.NoError(t, tx.TrySend(10))

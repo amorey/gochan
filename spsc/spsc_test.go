@@ -51,7 +51,7 @@ func TestRendezvous(t *testing.T) {
 	// A blocking Send must wait for Recv; after the handoff both complete.
 	sent := make(chan struct{})
 	go func() {
-		require.NoError(t, tx.Send(7))
+		assert.NoError(t, tx.Send(7))
 		close(sent)
 	}()
 	v, err := rx.Recv()
@@ -210,7 +210,7 @@ func TestStreamingPipeline(t *testing.T) {
 		defer wg.Done()
 		defer tx.Close()
 		for i := 0; i < n; i++ {
-			require.NoError(t, tx.Send(i))
+			assert.NoError(t, tx.Send(i))
 		}
 	}()
 	got := []int{}

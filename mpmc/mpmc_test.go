@@ -71,7 +71,7 @@ func TestRendezvous(t *testing.T) {
 	done := make(chan int, 1)
 	go func() {
 		v, err := rx.Recv()
-		require.NoError(t, err)
+		assert.NoError(t, err)
 		done <- v
 	}()
 	require.NoError(t, tx.Send(7))
@@ -293,7 +293,7 @@ func TestRecvUnblocksOnFirstSender(t *testing.T) {
 	got := make(chan int, 1)
 	go func() {
 		v, err := rx.Recv()
-		require.NoError(t, err)
+		assert.NoError(t, err)
 		got <- v
 	}()
 	tx := newTx(t, h)
@@ -499,7 +499,7 @@ func TestMultiProducerMultiConsumer(t *testing.T) {
 			defer producerWG.Done()
 			defer tx.Close()
 			for j := 0; j < itemsPer; j++ {
-				require.NoError(t, tx.Send(p*itemsPer+j))
+				assert.NoError(t, tx.Send(p*itemsPer+j))
 			}
 		}(i)
 	}

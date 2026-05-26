@@ -42,10 +42,18 @@ semantics tables, error meanings). When changing public behavior, update
   capacity. `broadcast.New[T](0)` panics; the other queue constructors
   accept `0` as rendezvous and panic on negative capacity.
 - Handle `Close()` is always idempotent. Close-all is equivalent to calling
-  `Close()` on every handle the hub has handed out — no separate semantics.
-- `Receiver.Chan()` is *not* closed by `Receiver.Close()`; it only closes
-  when the sender closes (directly or via close-all) and the buffer drains.
-  This mirrors `close()` on a raw Go channel.
+  `Close()` on every handle the hub has handed out, with one exception:
+  `watch.Hub.Close()` only closes the sender so live receivers can still
+  observe the final published value.
+- `Receiver.Chan()` close behavior depends on the package family:
+  - Queue-style (`spsc`, `spmc`, `mpsc`, `mpmc`): the channel is the shared
+    buffer; `Receiver.Close()` does *not* close it. It only closes when
+    the sender closes (directly or via close-all) and the buffer drains,
+    mirroring `close()` on a raw Go channel.
+  - Per-receiver feeder (`broadcast`, `watch`): the channel is private to
+    the receiver and driven by a per-receiver feeder goroutine.
+    `Receiver.Close()` *does* close it (the feeder shuts down), and
+    sender-close also closes it after the feeder drains its last value.
 - Don't call close-all concurrently with an active `Send` from a different
   goroutine — it inherits the sender's close discipline.
 

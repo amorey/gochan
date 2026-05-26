@@ -58,7 +58,7 @@ func TestRendezvous(t *testing.T) {
 	assert.ErrorIs(t, tx.TrySend(1), gochan.ErrFull)
 	sent := make(chan struct{})
 	go func() {
-		require.NoError(t, tx.Send(7))
+		assert.NoError(t, tx.Send(7))
 		close(sent)
 	}()
 	v, err := rx.Recv()

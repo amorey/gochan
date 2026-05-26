@@ -59,7 +59,7 @@ func TestRendezvous(t *testing.T) {
 	assert.ErrorIs(t, tx.TrySend(1), gochan.ErrFull)
 	sent := make(chan struct{})
 	go func() {
-		require.NoError(t, tx.Send(7))
+		assert.NoError(t, tx.Send(7))
 		close(sent)
 	}()
 	v, err := rx.Recv()
@@ -256,7 +256,7 @@ func TestRecvUnblocksOnFirstSend(t *testing.T) {
 	done := make(chan int, 1)
 	go func() {
 		v, err := rx.Recv()
-		require.NoError(t, err)
+		assert.NoError(t, err)
 		done <- v
 	}()
 	tx := newTx(t, h)
@@ -424,7 +424,7 @@ func TestMultiProducerFanIn(t *testing.T) {
 			defer wg.Done()
 			defer tx.Close()
 			for j := 0; j < itemsPer; j++ {
-				require.NoError(t, tx.Send(p*itemsPer+j))
+				assert.NoError(t, tx.Send(p*itemsPer+j))
 			}
 		}(i)
 	}

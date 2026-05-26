@@ -197,7 +197,7 @@ Every `Sender` and `Receiver` implements the common interfaces defined in [`goch
 
 ```go
 type Sender[T any] interface {
-    Send(v T) error                              // blocks until delivered or closed
+    Send(v T) error                              // blocks until accepted or closed (broadcast/watch never block)
     TrySend(v T) error                           // returns ErrFull / ErrClosed / ErrNotReady immediately
     SendContext(ctx context.Context, v T) error  // blocks with cancellation
     Close()                                      // idempotent
@@ -242,13 +242,13 @@ For `oneshot`, `Chan()` exposes the one-slot delivery channel; sender-close clos
 
 ### Close semantics
 
-There are two close operations: per-handle (`Sender.Close()` / `Receiver.Close()`), and close-all (`Hub.Close()` or the function returned by `oneshot.New` / `spsc.New`). Close-all is exactly equivalent to calling `Close()` on every handle the hub has handed out — no separate semantics.
+There are two close operations: per-handle (`Sender.Close()` / `Receiver.Close()`), and close-all (`Hub.Close()` or the function returned by `oneshot.New` / `spsc.New`). For every package except `watch`, close-all is equivalent to calling `Close()` on every handle the hub has handed out. The `watch.Hub.Close()` exception only closes the sender, deliberately leaving live receivers free to observe the final value before they see `ErrClosed`.
 
 | Call                | Effect                                                                                                    |
 | ------------------- | --------------------------------------------------------------------------------------------------------- |
 | `Sender.Close()`    | Graceful end-of-stream. On queue-style channels, buffered values remain receivable; `Recv` and `Chan` drain them, then see `ErrClosed` / channel-closed. |
 | `Receiver.Close()`  | This handle only. On multi-receiver hubs, other receivers and the sender keep running. Buffered values are abandoned for `Recv` on this handle. |
-| close-all           | `Hub.Close()` on hub-style packages, or the third return value from the constructor on singleton-pair packages. Equivalent to receiver(s) `Close` then sender `Close`. For Recv-style callers, buffered values are abandoned (the receiver close runs first); for `Chan` consumers, the underlying channel is closed and they drain remaining values before seeing closed. |
+| close-all           | `Hub.Close()` on hub-style packages, or the third return value from the constructor on singleton-pair packages. For most packages, equivalent to receiver(s) `Close` then sender `Close`: Recv-style callers see `ErrClosed` immediately (the receiver close runs first); `Chan` consumers drain remaining values before seeing closed. `watch.Hub.Close()` is the exception — it closes only the sender so that each live receiver can still observe the final published value on one more Recv / Chan read before subsequent calls return `ErrClosed`. |
 
 All three are idempotent. The close-all inherits the sender's close discipline — don't call it concurrently with an active `Send` from a different goroutine.
 

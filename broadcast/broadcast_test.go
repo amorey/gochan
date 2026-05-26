@@ -70,7 +70,7 @@ func TestFanOutDeliversToEveryReceiver(t *testing.T) {
 				if errors.Is(err, gochan.ErrClosed) {
 					return
 				}
-				require.NoError(t, err)
+				assert.NoError(t, err)
 				got[i] = append(got[i], v)
 			}
 		}()
@@ -436,7 +436,7 @@ func TestChanDeliversInOrder(t *testing.T) {
 
 	go func() {
 		for i := 0; i < 10; i++ {
-			require.NoError(t, tx.Send(i))
+			assert.NoError(t, tx.Send(i))
 		}
 		tx.Close()
 	}()
@@ -536,7 +536,7 @@ func TestConcurrentPublishers(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perPub; i++ {
-				require.NoError(t, tx.Send(p*perPub+i))
+				assert.NoError(t, tx.Send(p*perPub+i))
 			}
 		}()
 	}
@@ -580,7 +580,7 @@ func TestConcurrentReceiversAllSeeEveryValue(t *testing.T) {
 				if errors.Is(err, gochan.ErrClosed) {
 					return
 				}
-				require.NoError(t, err)
+				assert.NoError(t, err)
 				atomic.AddInt64(&counts[i], 1)
 			}
 		}()

@@ -76,7 +76,7 @@ func TestRecvBlocksUntilChange(t *testing.T) {
 	got := make(chan int, 1)
 	go func() {
 		v, err := rx.Recv()
-		require.NoError(t, err)
+		assert.NoError(t, err)
 		got <- v
 	}()
 
@@ -120,7 +120,7 @@ func TestSendNeverBlocks(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		for i := 0; i < 1000; i++ {
-			require.NoError(t, tx.Send(i))
+			assert.NoError(t, tx.Send(i))
 		}
 		close(done)
 	}()
@@ -567,7 +567,7 @@ func TestConcurrentPublishersOnSingletonSender(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < writesPer; j++ {
-				require.NoError(t, tx.Send(i*writesPer+j))
+				assert.NoError(t, tx.Send(i*writesPer+j))
 			}
 		}()
 	}
@@ -613,7 +613,7 @@ func TestConcurrentReceivers(t *testing.T) {
 				if errors.Is(err, gochan.ErrClosed) {
 					return
 				}
-				require.NoError(t, err)
+				assert.NoError(t, err)
 				seen[i].Add(1)
 			}
 		}()

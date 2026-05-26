@@ -16,7 +16,7 @@
 // drop-newest policy on top of the package's default drop-oldest.
 //
 // A freshly constructed hub has no receivers; values published before
-// any [Hub.Receiver] call are written into the ring but never delivered.
+// any [Hub.Receiver] call are dropped without being written to the ring.
 // Late subscribers start at the sender's current write position — they
 // do not see historical values.
 //
@@ -71,7 +71,7 @@
 //
 // No empty-hub gating. Unlike spmc / mpmc, broadcast does not block Send
 // on the first [Hub.Receiver] call. Values published with no subscribers
-// are written to the ring but never delivered — subsequent subscribers
+// are dropped without being written to the ring — subsequent subscribers
 // start at "now" and don't see them. This package therefore never
 // returns [gochan.ErrNotReady].
 //
@@ -317,6 +317,9 @@ func (h *Hub[T]) Close() {
 	s.receivers = nil
 	s.minCount = 0
 	s.minStale = false
+	// Drop payload references — buffered values are abandoned, and
+	// holding them here would pin them for the hub's lifetime.
+	clear(s.buf)
 }
 
 // Send publishes v to the ring and returns immediately. Send never
@@ -509,6 +512,11 @@ func (rx *Receiver[T]) TryRecv() (T, error) {
 	}
 	rx.s.mu.Lock()
 	defer rx.s.mu.Unlock()
+	// rx.done can flip between the lock-free check above and acquiring mu;
+	// Close holds mu before closing done, so a re-check here is race-free.
+	if rx.done.IsClosed() {
+		return z, gochan.ErrClosed
+	}
 	return rx.tryReadLocked()
 }
 

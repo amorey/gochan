@@ -53,10 +53,11 @@
 // than waiting for the next change.
 //
 // Late subscribers see the current value. Unlike broadcast, which gives
-// late subscribers only future values, a watch receiver registered at
-// time T sees whatever value is current at time T as its first Recv
-// result. There is no concept of "missed values" — only "the latest
-// value, when you ask for it."
+// late subscribers only future values, a watch receiver's first Recv
+// returns whatever value is current at the time of that first Recv (not
+// at the time of registration — there is no snapshot taken when
+// [Hub.Receiver] returns). There is no concept of "missed values" —
+// only "the latest value, when you ask for it."
 //
 // Sender Send never blocks. By design, Send always returns immediately
 // (success or [gochan.ErrClosed]). Slow receivers cannot apply
@@ -144,10 +145,11 @@ type Receiver[T any] struct {
 }
 
 // New creates a watch Hub seeded with initial as the current value.
-// Every Receiver obtained from this hub returns initial as its first
-// Recv result unless the sender has already published a newer value
-// by the time the receiver registers, in which case the receiver sees
-// that newer value.
+// A Receiver obtained from this hub returns initial as its first Recv
+// result unless the sender has published a newer value by the time
+// that first Recv runs, in which case the receiver sees the latest
+// value at read time. Registration via [Hub.Receiver] does not
+// snapshot the slot.
 func New[T any](initial T) *Hub[T] {
 	s := &shared[T]{
 		val:    initial,
@@ -165,11 +167,12 @@ func New[T any](initial T) *Hub[T] {
 func (h *Hub[T]) Sender() *Sender[T] { return h.tx }
 
 // Receiver returns a new receiver bound to the hub. The receiver's
-// first Recv returns the hub's current value immediately; subsequent
-// Recv calls block until the value changes again. If the hub has
-// already been closed the receiver still delivers the final value
-// once (its lastSeen=0 < version) before subsequent calls return
-// [gochan.ErrClosed].
+// first Recv returns whatever value is current at the time of that
+// first Recv (not at the time of this call — registration does not
+// snapshot the slot); subsequent Recv calls block until the value
+// changes again. If the hub has already been closed the receiver
+// still delivers the final value once (its lastSeen=0 < version)
+// before subsequent calls return [gochan.ErrClosed].
 func (h *Hub[T]) Receiver() *Receiver[T] {
 	rx := &Receiver[T]{s: h.s}
 	rx.done.Init()
@@ -330,6 +333,11 @@ func (rx *Receiver[T]) TryRecv() (T, error) {
 	// mu only to read val coherently with the writer.
 	rx.s.mu.Lock()
 	defer rx.s.mu.Unlock()
+	// rx.done can flip between the lock-free check above and acquiring mu;
+	// Close holds mu before closing done, so a re-check here is race-free.
+	if rx.done.IsClosed() {
+		return z, gochan.ErrClosed
+	}
 	v := rx.s.val
 	rx.lastSeen = rx.s.version.Load()
 	return v, nil

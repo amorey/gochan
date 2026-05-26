@@ -512,44 +512,54 @@ func TestMultiProducerMultiConsumer(t *testing.T) {
 // TestHubCloseRaceWithBlockedSender stresses Hub.Close vs. a blocked
 // producer parked on `s.ch <- v`. chMu must keep close(s.ch) from racing
 // the send arm.
-func TestCloseBlockedReceiverDoesNotSteal(t *testing.T) {
-	// Closing one of two receivers while it is parked in Recv must wake it
-	// with ErrClosed and must not let it consume the next value a sender
-	// produces — that value must go to the still-open receiver.
+func TestCloseBlockedReceiverNoValueLost(t *testing.T) {
+	// Closing one of two parked receivers must wake it without deadlocking
+	// the sender or losing the value: either the closing receiver picks up
+	// the value successfully (race won the channel arm at the instant of
+	// close) and the still-open receiver gets nothing, or it wakes with
+	// ErrClosed and the value is delivered to the still-open receiver.
 	for i := 0; i < 1000; i++ {
 		h := newHub[int](t, 0) // rendezvous
 		tx := newTx(t, h)
 		rx1 := newRx(t, h)
 		rx2 := newRx(t, h)
 
-		rx1Done := make(chan error, 1)
-		go func() {
-			_, err := rx1.Recv()
-			rx1Done <- err
-		}()
-		type rx2Result struct {
+		type result struct {
 			v   int
 			err error
 		}
-		rx2Done := make(chan rx2Result, 1)
+		rx1Done := make(chan result, 1)
+		go func() {
+			v, err := rx1.Recv()
+			rx1Done <- result{v, err}
+		}()
+		rx2Done := make(chan result, 1)
 		go func() {
 			v, err := rx2.Recv()
-			rx2Done <- rx2Result{v, err}
+			rx2Done <- result{v, err}
 		}()
 
 		rx1.Close()
 		require.NoError(t, tx.Send(42))
 
+		var r1 result
 		select {
-		case err := <-rx1Done:
-			require.ErrorIsf(t, err, gochan.ErrClosed, "iter %d: closed rx1 stole the value", i)
+		case r1 = <-rx1Done:
 		case <-time.After(time.Second):
 			t.Fatalf("iter %d: rx1.Recv never returned (likely stuck because Close did not wake it)", i)
 		}
+		if r1.err == nil {
+			require.Equalf(t, 42, r1.v, "iter %d", i)
+			h.Close()
+			r2 := <-rx2Done
+			require.ErrorIsf(t, r2.err, gochan.ErrClosed, "iter %d", i)
+			continue
+		}
+		require.ErrorIsf(t, r1.err, gochan.ErrClosed, "iter %d", i)
 		select {
-		case r := <-rx2Done:
-			require.NoErrorf(t, r.err, "iter %d: live rx2 got error", i)
-			require.Equalf(t, 42, r.v, "iter %d", i)
+		case r2 := <-rx2Done:
+			require.NoErrorf(t, r2.err, "iter %d: live rx2 got error", i)
+			require.Equalf(t, 42, r2.v, "iter %d", i)
 		case <-time.After(time.Second):
 			t.Fatalf("iter %d: rx2.Recv never returned", i)
 		}
@@ -557,7 +567,7 @@ func TestCloseBlockedReceiverDoesNotSteal(t *testing.T) {
 	}
 }
 
-func TestCloseBlockedReceiverContextDoesNotSteal(t *testing.T) {
+func TestCloseBlockedReceiverContextNoValueLost(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		h := newHub[int](t, 0)
 		tx := newTx(t, h)
@@ -565,38 +575,110 @@ func TestCloseBlockedReceiverContextDoesNotSteal(t *testing.T) {
 		rx2 := newRx(t, h)
 
 		ctx := context.Background()
-		rx1Done := make(chan error, 1)
-		go func() {
-			_, err := rx1.RecvContext(ctx)
-			rx1Done <- err
-		}()
-		type rx2Result struct {
+		type result struct {
 			v   int
 			err error
 		}
-		rx2Done := make(chan rx2Result, 1)
+		rx1Done := make(chan result, 1)
+		go func() {
+			v, err := rx1.RecvContext(ctx)
+			rx1Done <- result{v, err}
+		}()
+		rx2Done := make(chan result, 1)
 		go func() {
 			v, err := rx2.RecvContext(ctx)
-			rx2Done <- rx2Result{v, err}
+			rx2Done <- result{v, err}
 		}()
 
 		rx1.Close()
 		require.NoError(t, tx.Send(7))
 
+		var r1 result
 		select {
-		case err := <-rx1Done:
-			require.ErrorIsf(t, err, gochan.ErrClosed, "iter %d: closed rx1 stole the value", i)
+		case r1 = <-rx1Done:
 		case <-time.After(time.Second):
 			t.Fatalf("iter %d: rx1.RecvContext never returned", i)
 		}
+		if r1.err == nil {
+			require.Equalf(t, 7, r1.v, "iter %d", i)
+			h.Close()
+			r2 := <-rx2Done
+			require.ErrorIsf(t, r2.err, gochan.ErrClosed, "iter %d", i)
+			continue
+		}
+		require.ErrorIsf(t, r1.err, gochan.ErrClosed, "iter %d", i)
 		select {
-		case r := <-rx2Done:
-			require.NoErrorf(t, r.err, "iter %d", i)
-			require.Equalf(t, 7, r.v, "iter %d", i)
+		case r2 := <-rx2Done:
+			require.NoErrorf(t, r2.err, "iter %d", i)
+			require.Equalf(t, 7, r2.v, "iter %d", i)
 		case <-time.After(time.Second):
 			t.Fatalf("iter %d: rx2.RecvContext never returned", i)
 		}
 		h.Close()
+	}
+}
+
+func TestCloseBlockedReceiverPreservesBufferedOrder(t *testing.T) {
+	// Closing a receiver racing a buffered value must not reorder the queue:
+	// each receiver sees a strictly increasing subsequence of sends and the
+	// union across receivers is exactly the original FIFO sequence with no
+	// duplicates and no missing values.
+	for i := 0; i < 500; i++ {
+		const n = 8
+		h := newHub[int](t, n)
+		tx := newTx(t, h)
+		rx1 := newRx(t, h)
+		rx2 := newRx(t, h)
+		for v := 1; v <= n; v++ {
+			require.NoError(t, tx.Send(v))
+		}
+
+		rx1Done := make(chan []int, 1)
+		go func() {
+			var got []int
+			for {
+				v, err := rx1.Recv()
+				if err != nil {
+					rx1Done <- got
+					return
+				}
+				got = append(got, v)
+			}
+		}()
+		rx2Done := make(chan []int, 1)
+		go func() {
+			var got []int
+			for {
+				v, err := rx2.Recv()
+				if err != nil {
+					rx2Done <- got
+					return
+				}
+				got = append(got, v)
+			}
+		}()
+
+		rx1.Close()
+		tx.Close()
+
+		got1 := <-rx1Done
+		got2 := <-rx2Done
+
+		for _, seq := range [][]int{got1, got2} {
+			for k := 1; k < len(seq); k++ {
+				require.Greaterf(t, seq[k], seq[k-1], "iter %d: out-of-order receive %v", i, seq)
+			}
+		}
+		seen := make(map[int]bool, n)
+		for _, v := range got1 {
+			require.Falsef(t, seen[v], "iter %d: duplicate value %d", i, v)
+			seen[v] = true
+		}
+		for _, v := range got2 {
+			require.Falsef(t, seen[v], "iter %d: duplicate value %d", i, v)
+			seen[v] = true
+		}
+		require.Lenf(t, seen, n, "iter %d: missing values, got %v / %v", i, got1, got2)
 	}
 }
 

@@ -198,14 +198,14 @@ Every `Sender` and `Receiver` implements the common interfaces defined in [`goch
 ```go
 type Sender[T any] interface {
     Send(v T) error                              // blocks until delivered or closed
-    TrySend(v T) error                           // returns ErrFull / ErrClosed immediately
+    TrySend(v T) error                           // returns ErrFull / ErrClosed / ErrNotReady immediately
     SendContext(ctx context.Context, v T) error  // blocks with cancellation
     Close()                                      // idempotent
 }
 
 type Receiver[T any] interface {
     Recv() (T, error)                            // blocks until received or closed
-    TryRecv() (T, error)                         // returns ErrEmpty / ErrClosed immediately
+    TryRecv() (T, error)                         // returns ErrEmpty / ErrClosed / ErrNotReady / ErrLagged immediately
     RecvContext(ctx context.Context) (T, error)  // blocks with cancellation
     Chan() <-chan T                              // native channel for use with select
     Close()                                      // idempotent

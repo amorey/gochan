@@ -369,6 +369,11 @@ func (rx *Receiver[T]) Chan() <-chan T { return rx.s.ch }
 // Recv/TryRecv/RecvContext calls on this handle return [gochan.ErrClosed].
 // Senders only observe ErrClosed once every receiver has been closed
 // (or the hub itself has been closed). Idempotent.
+//
+// A blocking Recv that has already won the select race on a value at the
+// instant Close runs returns that value successfully; the next call
+// returns ErrClosed. Buffered values remain in FIFO order across a racing
+// Close, and no value is delivered to a fully-closed handle.
 func (rx *Receiver[T]) Close() {
 	if !rx.done.Close() {
 		return

@@ -168,7 +168,7 @@ Here are some design decisions to be aware of:
 
 **Queue-style channel capacity**: (`spsc`, `spmc`, `mpsc`, `mpmc`), capacity behaves exactly like Go's buffered channels because the implementation *is* a buffered Go channel underneath. `New[T](0)` is a rendezvous channel — `Send` blocks until a `Recv` is ready. `New[T](n)` allows `n` queued values before `Send` blocks.
 
-**One close-all per package**: Every constructor exposes a single "close everything" entry point alongside the per-handle `Sender.Close()` and `Receiver.Close()`. Singleton-pair packages (`oneshot`, `spsc`) return a `func()` as the third value of their constructor; multi-side packages return a `*Hub[T]` whose `Close()` method serves the same purpose. In both cases the function is equivalent to calling `Close()` on every handle: the sender's close drains buffered values (`Chan` consumers drain then exit), while the receiver-side close immediately fails `Recv`/`TryRecv`/`RecvContext` with `ErrClosed`. Inherits the sender's close discipline — don't call it concurrently with an active `Send` from a different goroutine.
+**One close-all per package**: Every constructor exposes a single "close everything" entry point alongside the per-handle `Sender.Close()` and `Receiver.Close()`. Singleton-pair packages (`oneshot`, `spsc`) return a `func()` as the third value of their constructor; multi-side packages return a `*Hub[T]` whose `Close()` method serves the same purpose. In most packages the function is equivalent to calling `Close()` on every handle: the sender's close drains buffered values (`Chan` consumers drain then exit), while the receiver-side close immediately fails `Recv`/`TryRecv`/`RecvContext` with `ErrClosed`. The one exception is `watch.Hub.Close()`, which closes only the sender so live receivers can still observe the final published value once before subsequent calls return `ErrClosed`. Inherits the sender's close discipline — don't call it concurrently with an active `Send` from a different goroutine.
 
 **Receivers come and go independently on fan-out hubs**: For `spmc`, `broadcast`, `watch`, and `mpmc`, each `hub.Receiver()` call returns a fresh subscriber. Calling `Close()` on a single receiver removes only that receiver from the consumer set; the sender and other receivers are unaffected. This lets listeners come and go independently of the sender's lifecycle.
 
@@ -179,7 +179,7 @@ Here are some design decisions to be aware of:
 
 ### Constructors
 
-Singleton-pair packages (`oneshot`, `spsc`) return `(*Sender, *Receiver, func())` directly — both handles plus a close function that calls `Close` on each. Multi-side packages return a `*Hub[T]` that hands out `Sender` and `Receiver` handles via `hub.Sender()` / `hub.Receiver()` and exposes `hub.Close()` which closes every live handle.
+Singleton-pair packages (`oneshot`, `spsc`) return `(*Sender, *Receiver, func())` directly — both handles plus a close function that calls `Close` on each. Multi-side packages return a `*Hub[T]` that hands out `Sender` and `Receiver` handles via `hub.Sender()` / `hub.Receiver()` and exposes `hub.Close()` which closes every live handle (`watch.Hub.Close()` is the exception: it closes only the sender so live receivers can still observe the final published value).
 
 | Constructor             | Returns                              | Capacity arg | `0` allowed?     |
 | ----------------------- | ------------------------------------ | ------------ | ---------------- |
@@ -221,7 +221,7 @@ Receiver() *Receiver[T]  // same shape for the receive side
 Close()                  // closes every live handle; idempotent
 ```
 
-On singleton-side architectures (e.g. spmc's `Sender`, mpsc's `Receiver`), repeated calls return the same handle — `Sender()` and `Receiver()` are idempotent getters there. On multi-side architectures they hand out a fresh handle each call. After the hub has been closed, the returned handle reports `ErrClosed` on use; you don't have to check up-front.
+On singleton-side architectures (e.g. spmc's `Sender`, mpsc's `Receiver`), repeated calls return the same handle — `Sender()` and `Receiver()` are idempotent getters there. On multi-side architectures they hand out a fresh handle each call. After the hub has been closed, the returned handle reports `ErrClosed` on use; you don't have to check up-front. (A receiver obtained from a closed `watch` hub delivers the final published value once before reporting `ErrClosed`.)
 
 Singleton-pair packages (`oneshot`, `spsc`) have no hub at all. Their constructors return `(*Sender[T], *Receiver[T], func())` directly — both handles plus a close-all function — giving a compile-time guarantee that the handles cannot be requested twice.
 

@@ -477,6 +477,7 @@ func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 			return v, err
 		}
 		if rx.s.txClosed.Load() {
+			rx.unregisterLocked()
 			rx.s.mu.Unlock()
 			return z, gochan.ErrClosed
 		}
@@ -503,11 +504,10 @@ func (rx *Receiver[T]) TryRecv() (T, error) {
 	}
 	// Fast path: no new data since rx last read. writePos and
 	// txClosed are atomic, so we can short-circuit without taking
-	// mu. rx.pos is owned by this goroutine.
-	if rx.s.writePos.Load() == rx.pos {
-		if rx.s.txClosed.Load() {
-			return z, gochan.ErrClosed
-		}
+	// mu for the still-open case. rx.pos is owned by this goroutine.
+	// The EOF branch falls through to the locked section so it can
+	// unregister the receiver and release its slot in the ring.
+	if rx.s.writePos.Load() == rx.pos && !rx.s.txClosed.Load() {
 		return z, gochan.ErrEmpty
 	}
 	rx.s.mu.Lock()
@@ -517,7 +517,12 @@ func (rx *Receiver[T]) TryRecv() (T, error) {
 	if rx.done.IsClosed() {
 		return z, gochan.ErrClosed
 	}
-	return rx.tryReadLocked()
+	v, err := rx.tryReadLocked()
+	if err == gochan.ErrEmpty && rx.s.txClosed.Load() {
+		rx.unregisterLocked()
+		return z, gochan.ErrClosed
+	}
+	return v, err
 }
 
 // tryReadLocked consumes one value or reports lag. Returns
@@ -588,19 +593,28 @@ func (rx *Receiver[T]) Close() {
 	s := rx.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Close under mu so TrySend (also under mu) never observes a
-	// receiver whose done is closed but whose entry is still in
-	// s.receivers — otherwise a concurrent unsubscribe could leak a
-	// false ErrFull through the eviction check.
+	rx.unregisterLocked()
+}
+
+// unregisterLocked removes rx from the hub bookkeeping and clears the
+// ring if no live receivers remain. Idempotent — gated by rx.done.Close.
+// Caller must hold rx.s.mu.
+//
+// Closing under mu means TrySend (also under mu) never observes a
+// receiver whose done is closed but whose entry is still in
+// s.receivers — otherwise a concurrent unsubscribe could leak a false
+// ErrFull through the eviction check.
+//
+// Releases ring payloads once the last subscriber is gone: future Sends
+// will skip writes until a new receiver registers, so the existing
+// contents would otherwise pin references for the lifetime of the hub.
+func (rx *Receiver[T]) unregisterLocked() {
 	if !rx.done.Close() {
 		return
 	}
+	s := rx.s
 	delete(s.receivers, rx)
 	s.leaveMinCohortLocked(rx.pos)
-	// Release any payloads retained in the ring once the last
-	// subscriber is gone: future Sends will skip writes until a new
-	// receiver registers, so the existing contents would otherwise
-	// pin references for the lifetime of the hub.
 	if len(s.receivers) == 0 {
 		clear(s.buf)
 	}

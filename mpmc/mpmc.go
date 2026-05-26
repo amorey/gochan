@@ -121,8 +121,8 @@ type Sender[T any] struct {
 
 // Receiver is a receive-side handle of an mpmc pipeline. Obtain receivers
 // via [Hub.Receiver]. Each receiver carries its own done signal so that
-// closing one parked receiver wakes only that goroutine (and prevents it
-// from consuming a value that should go to a still-open peer).
+// closing one parked receiver wakes only that goroutine without disturbing
+// peers. See [Receiver.Close] for the close/in-flight Recv race semantics.
 type Receiver[T any] struct {
 	s    *shared[T]
 	done chancore.CloseOnce

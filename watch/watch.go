@@ -72,13 +72,15 @@
 // standard "final state" pattern — shutdown signals carrying a final
 // reason, last-known-good config on close, etc.
 //
-// Hub close-all. [Hub.Close] closes the sender and locks out future
-// [Hub.Receiver] calls. Live receivers observe sender-close through the
-// normal drain path: those that had not yet observed the latest value
-// may still receive it once via Recv / Chan; receivers already caught
-// up see [gochan.ErrClosed] immediately. A receiver obtained from a
-// hub that has already been closed delivers the final value once
-// before ErrClosed.
+// Hub close-all. [Hub.Close] closes only the sender — this is an
+// intentional exception to the close-everything pattern the other
+// multi-side packages follow, so that live receivers can still observe
+// the final published value. Live receivers observe sender-close
+// through the normal drain path: those that had not yet observed the
+// latest value may still receive it once via Recv / Chan; receivers
+// already caught up see [gochan.ErrClosed] immediately. A receiver
+// obtained from a hub that has already been closed likewise delivers
+// the final value once before ErrClosed.
 package watch
 
 import (

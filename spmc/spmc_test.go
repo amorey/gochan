@@ -431,7 +431,7 @@ func TestSenderCloseWithoutReceiversReturnsClosed(t *testing.T) {
 func TestHubCloseRaceWithBlockedSender(t *testing.T) {
 	for i := 0; i < 2000; i++ {
 		h, tx := newHubTx[int](t, 1)
-		_ = newRx(t, h) // register a receiver so Send progresses past rxReady
+		_ = newRx(t, h)                // register a receiver so Send progresses past rxReady
 		require.NoError(t, tx.Send(1)) // fill buffer; next Send must block
 		errCh := make(chan error, 1)
 		go func() { errCh <- tx.Send(2) }()

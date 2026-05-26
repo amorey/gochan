@@ -138,7 +138,41 @@ for {
 }
 ```
 
-## Common interface
+## Design notes
+
+Here are some design decisions to be aware of:
+
+**Bounded by default**: Unbounded queues are a memory-safety footgun. Only `mpsc` offers an unbounded variant, and the doc comment warns about it. Everything else takes an explicit capacity.
+
+**Queue-style channel capacity**: (`spsc`, `spmc`, `mpsc (bounded)`, `mpmc`), capacity behaves exactly like Go's buffered channels because the implementation *is* a buffered Go channel underneath. `NewBounded[T](0)` is a rendezvous channel — `Send` blocks until a `Recv` is ready. `NewBounded[T](n)` allows `n` queued values before `Send` blocks.
+
+**`mpsc.NewUnbounded` grows as needed**: Use this when bursts are unavoidable and bounded back-pressure would deadlock you — but watch for memory growth if producers can outrun the consumer indefinitely.
+
+**Broadcast and watch use Subscribe() semantics**: The `Sender` returned by `broadcast` and `watch` constructors exposes a `Subscribe()` method which returns a `Receiver`. Calling `Close()` on a subscriber receiver removes only that receiver from the subscriber set; the sender and other subscribers are unaffected. This lets listeners come and go independently of the sender's lifecycle.
+
+**Broadcast uses a ring buffer**: Slow receivers don't block the sender — they get `ErrLagged` and skip forward.
+
+
+## API
+
+### Constructors
+
+Each package exposes one or two constructors, some with explicit `capacity` arguments:
+
+| Constructor              | Capacity arg | `0` allowed?     | Semantics                                    |
+| ------------------------ | ------------ | ---------------- | -------------------------------------------- |
+| `oneshot.New[T]()`       | —            | —                | Single value, single delivery                |
+| `spsc.NewBounded[T](n)`  | yes          | yes (rendezvous) | FIFO queue, one sender and one receiver      |
+| `spmc.NewBounded[T](n)`  | yes          | yes (rendezvous) | One sender, items load-balanced to receivers |
+| `mpsc.NewBounded[T](n)`  | yes          | yes (rendezvous) | Fan-in from many senders to one receiver     |
+| `mpsc.NewUnbounded[T]()` | —            | —                | Grows without bound                          |
+| `mpmc.NewBounded[T](n)`  | yes          | yes (rendezvous) | Shared queue, any sender to any receiver     |
+| `broadcast.New[T](n)`    | yes          | no (panics)      | Ring buffer size; overwrites on lag          |
+| `watch.New[T](initial)`  | —            | —                | Single slot, always holds the latest value   |
+
+`broadcast` and `watch` return only a sender; receivers are obtained via `tx.Subscribe()`. This matches their fan-out nature — receivers come and go independently of the sender's lifecycle.
+
+### Common interface
 
 Every channel type implements the same two interfaces, so swapping architectures is easy:
 
@@ -161,7 +195,7 @@ type Receiver[T any] interface {
 
 The `Chan()` method on every receiver let's you use a native `chan` instance to receive messages to enable easy integration into common Go workflows (e.g. `select`).
 
-## Errors
+### Errors
 
 A small set of sentinel errors is shared across all packages:
 
@@ -175,40 +209,9 @@ type ErrLagged struct{ Skipped uint64 }  // broadcast only
 
 `ErrLagged` is specific to `broadcast` and signals that a slow receiver has fallen behind the ring buffer. The receiver is still usable and will resume from the oldest still-buffered value.
 
-## Constructors
+### Packages
 
-Each package exposes one or two constructors, some with explicit `capacity` arguments:
-
-| Constructor              | Capacity arg | `0` allowed?     | Semantics                                    |
-| ------------------------ | ------------ | ---------------- | -------------------------------------------- |
-| `oneshot.New[T]()`       | —            | —                | Single value, single delivery                |
-| `spsc.NewBounded[T](n)`  | yes          | yes (rendezvous) | FIFO queue, one sender and one receiver      |
-| `spmc.NewBounded[T](n)`  | yes          | yes (rendezvous) | One sender, items load-balanced to receivers |
-| `mpsc.NewBounded[T](n)`  | yes          | yes (rendezvous) | Fan-in from many senders to one receiver     |
-| `mpsc.NewUnbounded[T]()` | —            | —                | Grows without bound                          |
-| `mpmc.NewBounded[T](n)`  | yes          | yes (rendezvous) | Shared queue, any sender to any receiver     |
-| `broadcast.New[T](n)`    | yes          | no (panics)      | Ring buffer size; overwrites on lag          |
-| `watch.New[T](initial)`  | —            | —                | Single slot, always holds the latest value   |
-
-`broadcast` and `watch` return only a sender; receivers are obtained via `tx.Subscribe()`. This matches their fan-out nature — receivers come and go independently of the sender's lifecycle.
-
-## Design notes
-
-Here are some design decisions to be aware of:
-
-**Bounded by default**: Unbounded queues are a memory-safety footgun. Only `mpsc` offers an unbounded variant, and the doc comment warns about it. Everything else takes an explicit capacity.
-
-**Queue-style channel capacity**: (`spsc`, `spmc`, `mpsc (bounded)`, `mpmc`), capacity behaves exactly like Go's buffered channels because the implementation *is* a buffered Go channel underneath. `NewBounded[T](0)` is a rendezvous channel — `Send` blocks until a `Recv` is ready. `NewBounded[T](n)` allows `n` queued values before `Send` blocks.
-
-**`mpsc.NewUnbounded` grows as needed**: Use this when bursts are unavoidable and bounded back-pressure would deadlock you — but watch for memory growth if producers can outrun the consumer indefinitely.
-
-**Broadcast and watch use Subscribe() semantics**: The `Sender` returned by `broadcast` and `watch` constructors exposes a `Subscribe()` method which returns a `Receiver`. Calling `Close()` on a subscriber receiver removes only that receiver from the subscriber set; the sender and other subscribers are unaffected. This lets listeners come and go independently of the sender's lifecycle.
-
-**Broadcast uses a ring buffer**: Slow receivers don't block the sender — they get `ErrLagged` and skip forward.
-
-## API
-
-### oneshot
+#### oneshot
 
 A single-value, single-delivery channel. Exactly one `Send` will ever succeed, and the value is delivered to exactly one `Recv`. Either side may cancel by closing its handle, and the other side is notified via `ErrClosed`.
 
@@ -229,17 +232,21 @@ func New[T any]() (*Sender[T], *Receiver[T])
 
 ```go
 func (tx *Sender[T]) Send(v T) error
+func (tx *Sender[T]) TrySend(v T) error
+func (tx *Sender[T]) SendContext(ctx context.Context, v T) error
 func (tx *Sender[T]) Close()
 ```
 
 <dl>
   <dt><code>Send(v) error</code></dt>
   <dd>Deposits <code>v</code> into the slot and returns immediately — it does <em>not</em> wait for a receiver. Returns <code>ErrClosed</code> if the receiver has already been closed, or if <code>Send</code>/<code>Close</code> has already been called on this sender. The value is consumed on success; on <code>ErrClosed</code> it is dropped.</dd>
+  <dt><code>TrySend(v) error</code></dt>
+  <dd>Equivalent to <code>Send</code> for oneshot: <code>Send</code> never blocks, so there is no separate non-blocking path. Provided to satisfy the common <code>Sender</code> interface.</dd>
+  <dt><code>SendContext(ctx, v) error</code></dt>
+  <dd>Returns <code>ctx.Err()</code> if <code>ctx</code> is already cancelled and the value is not deposited; otherwise behaves like <code>Send</code>. Because <code>Send</code> never blocks, there is nothing for cancellation to interrupt mid-call — the context is only checked at entry.</dd>
   <dt><code>Close()</code></dt>
   <dd>Cancels the channel from the sender side. A pending or future <code>Recv</code> returns <code>ErrClosed</code>. Idempotent; safe to call after a successful <code>Send</code> (no-op).</dd>
 </dl>
-
-`TrySend` and `SendContext` call `Send` internally.
 
 **Receiver**
 
@@ -259,7 +266,7 @@ func (rx *Receiver[T]) Close()
   <dt><code>RecvContext(ctx) (T, error)</code></dt>
   <dd>Like <code>Recv</code>, but returns <code>ctx.Err()</code> if the context is cancelled first. Cancelling the context does <em>not</em> close the receiver; you can call <code>Recv</code> again afterwards.</dd>
   <dt><code>Chan() &lt;-chan T</code></dt>
-  <dd>Returns a native channel that will yield the value once and then be closed. Useful in <code>select</code>. Calling <code>Chan</code> multiple times returns the same channel.</dd>
+  <dd>Returns a native channel that yields the value once and then closes, or closes empty if the channel is cancelled before a successful <code>Send</code>. Useful in <code>select</code>. Calling <code>Chan</code> multiple times returns the same channel. If <code>Chan</code> is used, the value is delivered there and a subsequent <code>Recv</code> on the same receiver will return <code>ErrClosed</code> — pick one consumption mechanism per receiver.</dd>
   <dt><code>Close()</code></dt>
   <dd>Cancels the channel from the receiver side. A pending or future <code>Send</code> returns <code>ErrClosed</code> and the value (if any) is dropped. Idempotent.</dd>
 </dl>
@@ -275,14 +282,14 @@ func (rx *Receiver[T]) Close()
   <dd>Because <code>Send</code> does not block on a receiver, a sender that completes its work and then has its receiver vanish never leaks. Conversely, a <code>Recv</code> caller that wants to bail must use <code>RecvContext</code> or <code>Close</code>.</dd>
 </dl>
 
-### spsc
+#### spsc
 
-### spmc
+#### spmc
 
-### mpsc
+#### mpsc
 
-### mpmc
+#### mpmc
 
-### broadcast
+#### broadcast
 
-### watch
+#### watch

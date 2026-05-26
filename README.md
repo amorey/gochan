@@ -18,7 +18,7 @@ Go channels are extremely useful but they only ship with one type - mpmc (multip
 
 ## Installation
 
-```
+```console
 go get github.com/amorey/gochan
 ```
 
@@ -35,7 +35,7 @@ Requires Go 1.21+.
 
 ## Basic Usage
 
-**Oneshot** — return a singl value from a goroutine:
+**Oneshot** — return a single value from a goroutine:
 
 ```go
 tx, rx, closeAll := oneshot.New[Result]()
@@ -444,7 +444,7 @@ func (h *Hub[T]) Close()
 
 <dl>
   <dt><code>Sender() gochan.Sender[T]</code></dt>
-  <dd>Returns the singleton send-side handle. Repeated calls return the same handle. The handle is safe to share across goroutines — <code>Send</code>, <code>TrySend</code>, <code>SendContext</code>, and <code>Close</code> may all be called concurrently from any number of publishers. After the hub has been closed (explicitly via <code>Hub.Close</code>, or implicitly because every previously-registered receiver has already closed) the returned handle reports <code>ErrClosed</code> on use.</dd>
+  <dd>Returns the singleton send-side handle. Repeated calls return the same handle. The handle is safe to share across goroutines — <code>Send</code>, <code>TrySend</code>, <code>SendContext</code>, and <code>Close</code> may all be called concurrently from any number of goroutines. After the hub has been closed (explicitly via <code>Hub.Close</code>, or implicitly because every previously-registered receiver has already closed) the returned handle reports <code>ErrClosed</code> on use.</dd>
   <dt id="spmc-receiver"><code>Receiver() gochan.Receiver[T]</code></dt>
   <dd>Returns a new receiver bound to the shared queue. Use this to add workers to the consumer pool. Each returned receiver has its own independent <code>Close</code> state but shares the queue and sender-close signal with every other receiver. Safe to call concurrently. If the hub has been closed (or every previously-registered receiver has already been closed) the returned handle is pre-closed and reports <code>ErrClosed</code> on use.</dd>
   <dt><code>Close()</code></dt>
@@ -498,7 +498,7 @@ func (rx *Receiver[T]) Close()
 
 <dl>
   <dt>Shared singleton sender, multi consumer</dt>
-  <dd>The send-side handle returned by <code>hub.Sender()</code> is a singleton that is safe to share across goroutines: any number of publishers may call <code>Send</code> / <code>TrySend</code> / <code>SendContext</code> / <code>Close</code> concurrently on the same handle. Any number of goroutines may each hold their own <code>*Receiver[T]</code> (obtained from <code>hub.Receiver()</code>) and call <code>Recv</code>/<code>Close</code> on it; the implementation does not synchronize concurrent callers on the <em>same</em> receiver handle — call <code>hub.Receiver()</code> once per worker.</dd>
+  <dd>The send-side handle returned by <code>hub.Sender()</code> is a singleton that is safe to share across goroutines: any number of goroutines may call <code>Send</code> / <code>TrySend</code> / <code>SendContext</code> / <code>Close</code> concurrently on the same handle. Any number of goroutines may each hold their own <code>*Receiver[T]</code> (obtained from <code>hub.Receiver()</code>) and call <code>Recv</code>/<code>Close</code> on it; the implementation does not synchronize concurrent callers on the <em>same</em> receiver handle — call <code>hub.Receiver()</code> once per worker.</dd>
   <dt>Each value to exactly one receiver</dt>
   <dd>Values are <em>not</em> broadcast. A <code>Send</code> deposits one value into the shared queue, and the next <code>Recv</code> on any receiver removes it. Choice of receiver is non-deterministic and not guaranteed to be fair — it follows Go's channel-receive scheduling.</dd>
   <dt>FIFO ordering across the queue</dt>
@@ -899,3 +899,108 @@ for v := range source {
 ```
 
 #### watch
+
+A single-producer, multi-consumer latest-value channel. One `Sender` publishes
+values to any number of `Receiver`s, and each receiver always sees the most
+recent value — new sends overwrite older unread ones rather than queuing.
+Unlike a queue, intermediate values may be skipped; unlike `broadcast`, no
+history is retained. The hub is seeded with an initial value at construction,
+so a receiver's first `Recv` returns immediately without waiting for a send.
+
+Typical uses: configuration / settings propagation, "current state"
+distribution (current leader, current connection status, current feature
+flags), shutdown / cancellation signals carrying a final state, low-frequency
+control-plane updates where consumers only care about the latest snapshot.
+
+Unlike `broadcast`, only the latest value is retained — receivers that fall
+behind catch up to "now" rather than seeing each intermediate value. Unlike
+`spmc`/`mpmc`, every receiver sees its own copy of the value (it is not
+load-distributed).
+
+**Constructor**
+
+```go
+func New[T any](initial T) *Hub[T]
+```
+
+<dl>
+  <dt><code>New[T](initial)</code></dt>
+  <dd>Creates a fresh watch hub seeded with <code>initial</code> as the current value. There is no capacity argument — a watch hub holds exactly one slot, always overwritten by the next <code>Send</code>. Every <code>Receiver</code> obtained from this hub sees <code>initial</code> as its first <code>Recv</code> result (unless a newer value has been published before the receiver registers, in which case it sees that newer value). <code>Send</code> on a freshly constructed hub succeeds without waiting for a receiver.</dd>
+</dl>
+
+**Hub**
+
+```go
+func (h *Hub[T]) Sender()   gochan.Sender[T]
+func (h *Hub[T]) Receiver() gochan.Receiver[T]
+func (h *Hub[T]) Close()
+```
+
+<dl>
+  <dt><code>Sender() gochan.Sender[T]</code></dt>
+  <dd>Returns the singleton send-side handle. Repeated calls return the same handle. The handle is safe to share across goroutines — <code>Send</code>, <code>TrySend</code>, <code>SendContext</code>, and <code>Close</code> may all be called concurrently from any number of publishers. After the hub has been closed the returned handle reports <code>ErrClosed</code> on use.</dd>
+  <dt id="watch-receiver"><code>Receiver() gochan.Receiver[T]</code></dt>
+  <dd>Returns a new receiver bound to the hub. The receiver's first <code>Recv</code> returns the hub's current value immediately (the <code>initial</code> seed, or the most recent <code>Send</code> if one has happened since construction); subsequent <code>Recv</code> calls block until the value changes again. Each receiver has its own independent <code>Close</code> state and its own "have I seen the latest?" tracking. Safe to call concurrently. If the hub has been closed the returned handle is pre-closed and reports <code>ErrClosed</code> on use after delivering the final value once.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Closes the sender and locks out future <code>hub.Receiver()</code> calls. Live receivers that have not yet observed the latest value may still receive it once via <code>Recv</code> / <code>TryRecv</code> / <code>Chan</code> before subsequent operations return <code>ErrClosed</code>; receivers already caught up see <code>ErrClosed</code> immediately. Future <code>Sender</code> calls return the (now-closed) singleton; future <code>Receiver</code> calls return handles that deliver the final value once and then <code>ErrClosed</code>. Idempotent.</dd>
+</dl>
+
+**Sender**
+
+```go
+func (tx *Sender[T]) Send(v T) error
+func (tx *Sender[T]) TrySend(v T) error
+func (tx *Sender[T]) SendContext(ctx context.Context, v T) error
+func (tx *Sender[T]) Close()
+```
+
+<dl>
+  <dt><code>Send(v) error</code></dt>
+  <dd>Publishes <code>v</code> as the new current value and returns immediately. <code>Send</code> never blocks: if some receiver has not yet observed the previous value, that value is overwritten and the receiver will jump straight to <code>v</code> on its next <code>Recv</code> (intermediate values are silently skipped — this is the package's defining behavior). Returns <code>ErrClosed</code> if the sender or hub has been closed; on <code>ErrClosed</code> the value is dropped.</dd>
+  <dt><code>TrySend(v) error</code></dt>
+  <dd>Equivalent to <code>Send</code> for watch: <code>Send</code> never blocks, so there is no separate non-blocking path. Returns <code>ErrClosed</code> if closed, otherwise <code>nil</code>. Provided to satisfy the common <code>Sender</code> interface; <code>ErrFull</code> and <code>ErrNotReady</code> are never returned.</dd>
+  <dt><code>SendContext(ctx, v) error</code></dt>
+  <dd>Returns <code>ctx.Err()</code> if <code>ctx</code> is already cancelled; otherwise identical to <code>Send</code>. Because <code>Send</code> never blocks, the context is only checked at entry — there is nothing to interrupt mid-call.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Closes the sender. The current value remains observable to receivers that have not yet seen it (each receiver gets one final <code>Recv</code> returning the latest value before <code>ErrClosed</code>, if it had not already caught up). Further <code>Send</code> / <code>TrySend</code> / <code>SendContext</code> calls return <code>ErrClosed</code>. Idempotent.</dd>
+</dl>
+
+**Receiver**
+
+```go
+func (rx *Receiver[T]) Recv() (T, error)
+func (rx *Receiver[T]) TryRecv() (T, error)
+func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error)
+func (rx *Receiver[T]) Chan() <-chan T
+func (rx *Receiver[T]) Close()
+```
+
+<dl>
+  <dt><code>Recv() (T, error)</code></dt>
+  <dd>Returns the current value the first time it is called on a fresh receiver (the <code>initial</code> seed, or whatever has since been published). After that, blocks until the value changes again, then returns the new current value. If the sender publishes multiple times between consecutive <code>Recv</code> calls, only the most recent value is returned — intermediate values are dropped. Returns <code>ErrClosed</code> if this receiver / the hub is closed and the receiver has already observed the final value.</dd>
+  <dt><code>TryRecv() (T, error)</code></dt>
+  <dd>Non-blocking. Returns the current value if this receiver has not yet observed it (i.e., a new <code>Send</code> has happened since the last <code>Recv</code>, or this is the first call); <code>ErrEmpty</code> if the receiver is caught up to the current value; or <code>ErrClosed</code> if closed and the final value has already been observed.</dd>
+  <dt><code>RecvContext(ctx) (T, error)</code></dt>
+  <dd>Like <code>Recv</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled first. A ready value is preferred over a cancelled context. Cancellation does <em>not</em> close this receiver; subsequent calls remain valid.</dd>
+  <dt><code>Chan() &lt;-chan T</code></dt>
+  <dd>Returns a per-receiver native channel that yields successive values as they become current — never any intermediate dropped values. The first send on this channel is the seed (or whatever the current value is at <code>Chan</code> registration); subsequent sends are coalesced, so a fast publisher does not produce a backlog on the channel. The channel is closed when the sender (or hub) closes and this receiver has observed the final value. Each receiver has its own channel; repeated calls on the same receiver return the same channel. Closing the receiver does <em>not</em> close this channel — use <code>Recv</code>/<code>TryRecv</code> if you need to observe receiver-close.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Closes this receiver only. Other receivers and the sender are unaffected. Subsequent <code>Recv</code> / <code>TryRecv</code> / <code>RecvContext</code> calls return <code>ErrClosed</code>. Idempotent. Closing the last receiver does <em>not</em> close the sender — the sender keeps holding the current value and may continue to publish for future subscribers.</dd>
+</dl>
+
+**Semantics**
+
+<dl>
+  <dt>Latest-value-only delivery</dt>
+  <dd>Watch maintains a single slot containing the "current" value. Each <code>Send</code> overwrites that slot. Receivers see the slot's contents, not a stream — if the sender publishes A, B, C in rapid succession and the receiver only calls <code>Recv</code> once afterwards, the receiver sees C (A and B are silently dropped). This is the intended behavior; use <code>broadcast</code> if you need every value.</dd>
+  <dt>Initial value is part of the API</dt>
+  <dd>Every receiver's first <code>Recv</code> returns the current value without waiting — there is no "empty" state. This makes watch ideal for "current configuration / current state" patterns where new subscribers need to bootstrap immediately rather than waiting for the next change.</dd>
+  <dt>Late subscribers see the current value</dt>
+  <dd>Unlike <code>broadcast</code>, which gives late subscribers only future values, a watch receiver registered at time T sees whatever value is current at time T as its first <code>Recv</code> result. There is no concept of "missed values" — only "the latest value, when you ask for it."</dd>
+  <dt>Sender Send never blocks</dt>
+  <dd>By design, <code>Send</code> always returns immediately (success or <code>ErrClosed</code>). Slow receivers cannot apply backpressure to the publisher — they just skip ahead to the newest value when they next read.</dd>
+  <dt>Sender close delivers the final value</dt>
+  <dd>Closing the sender does <em>not</em> immediately fail in-flight or future <code>Recv</code> calls on receivers that have not yet observed the final value: each receiver gets one more <code>Recv</code> returning the current value (if it had not already caught up) before subsequent calls return <code>ErrClosed</code>. This is the standard "final state" pattern — shutdown signals carrying a final reason, last-known-good config on close, etc.</dd>
+  <dt>Hub close-all</dt>
+  <dd><code>Hub.Close()</code> closes the sender and locks out future <code>hub.Receiver()</code> calls. Live receivers observe sender-close through the normal drain path: those that had not yet observed the latest value may still receive it once via <code>Recv</code> / <code>Chan</code>; receivers already caught up see <code>ErrClosed</code> immediately. A receiver obtained from a hub that has already been closed delivers the final value once before <code>ErrClosed</code>.</dd>
+</dl>

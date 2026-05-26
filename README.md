@@ -4,6 +4,8 @@
 
 <img width="435" alt="gochan" src="https://github.com/user-attachments/assets/55534faa-494e-4038-a093-6c37f7040693" />
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/amorey/gochan.svg)](https://pkg.go.dev/github.com/amorey/gochan)
+
 ## Introduction
 
 Go channels are extremely useful but they only ship with one type - mpmc (multiple-producer/multiple-consumer), buffered or un-buffered. This means that we often have to add higher level logic to our data structures in order to implement common patterns like single-shot, broadcasts and watches. Inspired by [`Rust channels`](https://doc.rust-lang.org/rust-by-example/std_misc/channels.html), this library adds seven specialized channel types that aren't provided by Go's built-in `chan` type:

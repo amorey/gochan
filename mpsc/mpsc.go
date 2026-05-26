@@ -112,7 +112,7 @@ type Receiver[T any] struct{ s *shared[T] }
 //
 // Senders are obtained from the hub via [Hub.Sender]; a freshly
 // constructed hub has no senders, so Recv will block (or TryRecv will
-// report ErrEmpty) until at least one producer is registered and sends a
+// report ErrNotReady) until at least one producer is registered and sends a
 // value. The "all senders closed ⇒ ErrClosed" rule only kicks in once at
 // least one sender has been registered — a fresh hub is not implicitly
 // closed.

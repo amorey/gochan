@@ -331,6 +331,14 @@ func (tx *Sender[T]) Send(v T) error {
 	if s.txClosed.Load() {
 		return gochan.ErrClosed
 	}
+	// Skip the write when there are no subscribers: late receivers
+	// start at the current writePos and never replay history, so a
+	// stored value here would only pin the payload for GC and burn
+	// a slot copy. writePos stays put for the same reason — there
+	// is no observer that cares about its advance.
+	if len(s.receivers) == 0 {
+		return nil
+	}
 	wp := s.writePos.Load()
 	s.buf[wp%s.capacity] = v
 	s.writePos.Store(wp + 1)
@@ -354,8 +362,11 @@ func (tx *Sender[T]) TrySend(v T) error {
 	if s.txClosed.Load() {
 		return gochan.ErrClosed
 	}
+	if len(s.receivers) == 0 {
+		return nil
+	}
 	wp := s.writePos.Load()
-	if wp >= s.capacity && len(s.receivers) > 0 {
+	if wp >= s.capacity {
 		if s.minStale {
 			s.recomputeMinLocked()
 		}
@@ -448,6 +459,14 @@ func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 		if parked {
 			rx.s.waiters--
 			parked = false
+		}
+		// Re-check under mu so a Receiver.Close that wins the race
+		// between the pre-lock IsClosed check and the lock cannot
+		// hand a pending value to a closed receiver. Receiver.Close
+		// takes mu before closing done, so this check is stable.
+		if rx.done.IsClosed() {
+			rx.s.mu.Unlock()
+			return z, gochan.ErrClosed
 		}
 		v, err := rx.tryReadLocked()
 		if err != gochan.ErrEmpty {
@@ -570,4 +589,11 @@ func (rx *Receiver[T]) Close() {
 	}
 	delete(s.receivers, rx)
 	s.leaveMinCohortLocked(rx.pos)
+	// Release any payloads retained in the ring once the last
+	// subscriber is gone: future Sends will skip writes until a new
+	// receiver registers, so the existing contents would otherwise
+	// pin references for the lifetime of the hub.
+	if len(s.receivers) == 0 {
+		clear(s.buf)
+	}
 }

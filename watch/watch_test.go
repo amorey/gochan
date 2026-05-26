@@ -327,6 +327,52 @@ func TestReceiverCloseWakesBlockedRecv(t *testing.T) {
 	}
 }
 
+func TestReceiverCloseRacingPendingValue(t *testing.T) {
+	// Regression for the close-race that let a closed receiver
+	// observe a pending value because rx.done wasn't re-checked
+	// under mu. Each iteration: receiver caught up, sender publishes
+	// a new value, then Close and Recv race. Whoever wins, Recv must
+	// either deliver the pending value or report ErrClosed — never
+	// both, never neither.
+	const iters = 2000
+	for i := 0; i < iters; i++ {
+		h := newHub[int](t, 0)
+		tx := newTx(t, h)
+		rx := newRx(t, h)
+		_, _ = rx.Recv() // drain initial
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		var recvErr error
+		var recvVal int
+		go func() {
+			defer wg.Done()
+			<-start
+			recvVal, recvErr = rx.Recv()
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			rx.Close()
+		}()
+
+		require.NoError(t, tx.Send(42))
+		close(start)
+		wg.Wait()
+
+		if recvErr == nil {
+			require.Equal(t, 42, recvVal)
+		} else {
+			require.ErrorIs(t, recvErr, gochan.ErrClosed)
+		}
+		// After both winners, the receiver must be closed.
+		_, err := rx.Recv()
+		require.ErrorIs(t, err, gochan.ErrClosed)
+	}
+}
+
 func TestSenderCloseWakesBlockedRecv(t *testing.T) {
 	h := newHub[int](t, 0)
 	rx := newRx(t, h)

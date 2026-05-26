@@ -17,9 +17,12 @@
 // returns [gochan.ErrClosed].
 //
 // Cancellation. Either side may Close to abandon the exchange. The other
-// side observes [gochan.ErrClosed] on its next operation. If Send and
-// receiver-Close race, exactly one wins: either the value is delivered, or
-// the value is dropped and Send returns [gochan.ErrClosed].
+// side observes [gochan.ErrClosed] on its next operation. Send returning
+// nil means the value was accepted into the slot, not that a Recv has
+// observed it — Send does not block on a receiver. If the receiver closes
+// before consuming, the value is silently dropped and the receiver's next
+// Recv returns [gochan.ErrClosed]. Send only returns ErrClosed when the
+// pair was already terminal at the moment Send acquired the slot lock.
 //
 // No goroutine leak. Because Send does not block on a receiver, a sender
 // that completes its work and then has its receiver vanish never leaks.
@@ -72,7 +75,11 @@ func New[T any]() (*Sender[T], *Receiver[T], func()) {
 }
 
 // Send deposits v into the slot and returns immediately without waiting for a
-// receiver. Returns [gochan.ErrClosed] if the pair is already terminated.
+// receiver. Returns [gochan.ErrClosed] if the pair is already terminated at
+// the moment Send acquires the slot lock. A nil return means the value was
+// accepted into the slot; a concurrent [Receiver.Close] that wins the race
+// after Send commits may still drop the value before any Recv observes it
+// (see the package overview).
 func (tx *Sender[T]) Send(v T) error {
 	s := tx.s
 	s.mu.Lock()

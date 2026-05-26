@@ -159,6 +159,81 @@ func TestTrySendNoReceiversAlwaysSucceeds(t *testing.T) {
 	require.NoError(t, tx.TrySend(2)) // overwrites; no rx so no eviction
 }
 
+func TestSendSkipsRingWhenNoReceivers(t *testing.T) {
+	// Values published before any Receiver registers must not be
+	// retained — late subscribers start at "now" and would never
+	// observe them, so the ring would only pin payloads.
+	h := newHub[*int](t, 4)
+	tx := newTx(t, h)
+	val := 7
+	require.NoError(t, tx.Send(&val))
+	require.NoError(t, tx.Send(&val))
+	require.NoError(t, tx.TrySend(&val))
+
+	rx := newRx(t, h)
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gochan.ErrEmpty)
+}
+
+func TestLastReceiverLeaveClearsRing(t *testing.T) {
+	// After the last receiver closes, the ring should release its
+	// payloads so callers don't pin them for the hub's lifetime.
+	h := newHub[*int](t, 2)
+	rx := newRx(t, h)
+	tx := newTx(t, h)
+	val := 9
+	require.NoError(t, tx.Send(&val))
+	require.NoError(t, tx.Send(&val))
+	rx.Close()
+
+	// Re-subscribing and reading should not surface the stale values.
+	rx2 := newRx(t, h)
+	_, err := rx2.TryRecv()
+	assert.ErrorIs(t, err, gochan.ErrEmpty)
+}
+
+func TestReceiverCloseRacingPendingValue(t *testing.T) {
+	// Regression for the close-race that let a closed receiver
+	// observe a pending value because rx.done wasn't re-checked
+	// under mu. Each iteration: sender publishes one value, then
+	// Close and Recv race.
+	const iters = 2000
+	for i := 0; i < iters; i++ {
+		h := newHub[int](t, 4)
+		tx := newTx(t, h)
+		rx := newRx(t, h)
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		var recvErr error
+		var recvVal int
+		go func() {
+			defer wg.Done()
+			<-start
+			recvVal, recvErr = rx.Recv()
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			rx.Close()
+		}()
+
+		require.NoError(t, tx.Send(7))
+		close(start)
+		wg.Wait()
+
+		if recvErr == nil {
+			require.Equal(t, 7, recvVal)
+		} else {
+			require.ErrorIs(t, recvErr, gochan.ErrClosed)
+		}
+		_, err := rx.Recv()
+		require.ErrorIs(t, err, gochan.ErrClosed)
+	}
+}
+
 func TestTrySendIgnoresClosedReceivers(t *testing.T) {
 	h := newHub[int](t, 1)
 	rx := newRx(t, h)

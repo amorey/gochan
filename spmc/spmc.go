@@ -121,7 +121,7 @@ type Receiver[T any] struct {
 //
 // Receivers are obtained from the hub via [Hub.Receiver]; a freshly
 // constructed hub has no receivers, so Send will block (or TrySend will
-// report ErrFull) until at least one receiver is registered.
+// report ErrNotReady) until at least one receiver is registered.
 func New[T any](capacity int) *Hub[T] {
 	if capacity < 0 {
 		panic("spmc: negative capacity")

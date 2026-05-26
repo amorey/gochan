@@ -275,6 +275,14 @@ func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 			rx.s.waiters--
 			parked = false
 		}
+		// Re-check under mu so a Receiver.Close that wins the race
+		// between the pre-lock IsClosed check and the lock cannot
+		// hand a pending value to a closed receiver. Receiver.Close
+		// takes mu before closing done, so this check is stable.
+		if rx.done.IsClosed() {
+			rx.s.mu.Unlock()
+			return z, gochan.ErrClosed
+		}
 		if ver := rx.s.version.Load(); ver > rx.lastSeen {
 			v := rx.s.val
 			rx.lastSeen = ver
@@ -373,6 +381,10 @@ func (rx *Receiver[T]) feed() {
 			s.waiters--
 			parked = false
 		}
+		if rx.done.IsClosed() {
+			s.mu.Unlock()
+			return
+		}
 		ver := s.version.Load()
 		if ver > rx.lastSeen {
 			v := s.val
@@ -418,4 +430,12 @@ func (rx *Receiver[T]) feed() {
 // Idempotent. Closing the last receiver does not close the sender;
 // the sender keeps holding the current value and may continue to
 // publish for future subscribers.
-func (rx *Receiver[T]) Close() { rx.done.Close() }
+func (rx *Receiver[T]) Close() {
+	// Close under mu so a concurrent Recv that has acquired mu first
+	// cannot hand back a pending value to a now-closed receiver: the
+	// recvLoop re-checks rx.done after taking mu, and that check is
+	// stable as long as Close serializes through mu too.
+	rx.s.mu.Lock()
+	rx.done.Close()
+	rx.s.mu.Unlock()
+}

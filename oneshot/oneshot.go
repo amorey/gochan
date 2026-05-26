@@ -9,7 +9,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/yourname/gochan"
+	"github.com/amorey/gochan"
 )
 
 type shared[T any] struct {

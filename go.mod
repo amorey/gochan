@@ -1,4 +1,4 @@
-module github.com/yourname/gochan
+module github.com/amorey/gochan
 
 go 1.21
 

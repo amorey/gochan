@@ -9,8 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/yourname/gochan"
-	"github.com/yourname/gochan/oneshot"
+	"github.com/amorey/gochan"
+	"github.com/amorey/gochan/oneshot"
 )
 
 func TestImplementsCommonInterfaces(t *testing.T) {

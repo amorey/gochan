@@ -1,10 +1,10 @@
 # gochan
 
-*gochan is a small library for implementing multiple channel architectures for Go, inspired by Rust*
+*gochan is a small library containing multiple channel architectures for Go, inspired by Rust*
 
 ## Introduction
 
-Go channels are extremely useful but they only ship with one type - mpmc (multiple-producer/multiple-consumer), buffered or un-buffered. This means that we often have to add higher level logic to our data structures in order to implement common patterns like single-shot, broadcast and watch. Inspired by [`Rust channels`](https://doc.rust-lang.org/rust-by-example/std_misc/channels.html), this library adds seven specialized channel types to Go that you can use to implement common architectures not provided by Go's built-in `chan` type:
+Go channels are extremely useful but they only ship with one type - mpmc (multiple-producer/multiple-consumer), buffered or un-buffered. This means that we often have to add higher level logic to our data structures in order to implement common patterns like single-shot, broadcasts and watches. Inspired by [`Rust channels`](https://doc.rust-lang.org/rust-by-example/std_misc/channels.html), this library adds seven specialized channel types to Go that you can use to implement common architectures that aren't provided by Go's built-in `chan` type:
 
 | Package     | Senders | Receivers | Semantics                                                  |
 | ----------- | ------- | --------- | ---------------------------------------------------------- |
@@ -19,15 +19,15 @@ Go channels are extremely useful but they only ship with one type - mpmc (multip
 ## Installation
 
 ```
-go get github.com/yourname/gochan
+go get github.com/amorey/gochan
 ```
 
 Each architecture lives in its own subpackage; import the ones you need:
 
 ```go
 import (
-    "github.com/yourname/gochan/mpsc"
-    "github.com/yourname/gochan/broadcast"
+    "github.com/amorey/gochan/mpsc"
+    "github.com/amorey/gochan/broadcast"
 )
 ```
 
@@ -283,6 +283,82 @@ func (rx *Receiver[T]) Close()
 </dl>
 
 #### spsc
+
+A single-producer, single-consumer FIFO queue. One `Sender` feeds values in
+order to one `Receiver`. Capacity behaves exactly like a Go buffered channel:
+`NewBounded[T](0)` is a rendezvous channel, `NewBounded[T](n)` allows `n`
+queued values before `Send` blocks.
+
+Typical uses: streaming pipelines between two cooperating goroutines, a
+producer/consumer stage in a larger dataflow, decoupling a fast producer from
+a slow consumer with a fixed-size buffer.
+
+**Constructor**
+
+```go
+func NewBounded[T any](capacity int) (*Sender[T], *Receiver[T])
+```
+
+<dl>
+  <dt><code>NewBounded[T](capacity)</code></dt>
+  <dd>Creates a fresh spsc pair backed by a buffered Go channel of the given <code>capacity</code>. <code>capacity == 0</code> yields a rendezvous channel where <code>Send</code> blocks until a matching <code>Recv</code> is ready. <code>capacity &lt; 0</code> panics.</dd>
+</dl>
+
+**Sender**
+
+```go
+func (tx *Sender[T]) Send(v T) error
+func (tx *Sender[T]) TrySend(v T) error
+func (tx *Sender[T]) SendContext(ctx context.Context, v T) error
+func (tx *Sender[T]) Close()
+```
+
+<dl>
+  <dt><code>Send(v) error</code></dt>
+  <dd>Enqueues <code>v</code>, blocking while the buffer is full. Returns <code>ErrClosed</code> if the sender or receiver has been closed; on <code>ErrClosed</code> the value is dropped.</dd>
+  <dt><code>TrySend(v) error</code></dt>
+  <dd>Non-blocking. Returns <code>ErrFull</code> if the buffer is full, <code>ErrClosed</code> if closed, or <code>nil</code> on success.</dd>
+  <dt><code>SendContext(ctx, v) error</code></dt>
+  <dd>Like <code>Send</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled before the value is enqueued. The value is dropped on cancellation.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Closes the sender. Already-queued values remain receivable; a subsequent <code>Recv</code> drains them and then returns <code>ErrClosed</code>. Further <code>Send</code> calls return <code>ErrClosed</code>. Idempotent. Intended to be called by the single producer — spsc does not synchronize concurrent callers on the sender side.</dd>
+</dl>
+
+**Receiver**
+
+```go
+func (rx *Receiver[T]) Recv() (T, error)
+func (rx *Receiver[T]) TryRecv() (T, error)
+func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error)
+func (rx *Receiver[T]) Chan() <-chan T
+func (rx *Receiver[T]) Close()
+```
+
+<dl>
+  <dt><code>Recv() (T, error)</code></dt>
+  <dd>Blocks until a value is available. Returns the next value in FIFO order, or <code>ErrClosed</code> if the buffer is empty and the sender has closed (or the receiver itself is closed).</dd>
+  <dt><code>TryRecv() (T, error)</code></dt>
+  <dd>Non-blocking. Returns the next value if one is buffered, <code>ErrEmpty</code> if the buffer is empty but the sender is still open, or <code>ErrClosed</code> if the buffer is empty and closed.</dd>
+  <dt><code>RecvContext(ctx) (T, error)</code></dt>
+  <dd>Like <code>Recv</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled first. Cancellation does <em>not</em> close the receiver; subsequent calls remain valid.</dd>
+  <dt><code>Chan() &lt;-chan T</code></dt>
+  <dd>Returns the underlying receive-only channel, suitable for use in <code>select</code>. The channel is closed when the sender closes and the buffer drains. Closing the receiver does <em>not</em> close this channel — use <code>Recv</code>/<code>TryRecv</code> (which observe receiver-close) if you need that signal. Repeated calls return the same channel.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Closes the receiver. Pending or future <code>Send</code> calls return <code>ErrClosed</code>, and subsequent <code>Recv</code>/<code>TryRecv</code>/<code>RecvContext</code> calls return <code>ErrClosed</code>. Any values still buffered are abandoned (no further <code>Recv</code> will see them). Idempotent.</dd>
+</dl>
+
+**Semantics**
+
+<dl>
+  <dt>Single producer / single consumer</dt>
+  <dd>Exactly one goroutine should call <code>Send</code>/<code>Close</code> on the sender and exactly one goroutine should call <code>Recv</code>/<code>Close</code> on the receiver. The implementation does not synchronize multiple concurrent callers on the same side.</dd>
+  <dt>FIFO ordering</dt>
+  <dd>Values are received in the exact order they were sent.</dd>
+  <dt>Drain on sender close</dt>
+  <dd>Closing the sender does not discard already-buffered values; the receiver drains them in order before observing <code>ErrClosed</code>. Closing the <em>receiver</em>, by contrast, drops anything still in the buffer.</dd>
+  <dt>Backpressure</dt>
+  <dd>A bounded buffer applies natural backpressure: when full, <code>Send</code> blocks until the consumer makes room. Use <code>capacity == 0</code> for strict rendezvous handoff with no buffering.</dd>
+</dl>
 
 #### spmc
 

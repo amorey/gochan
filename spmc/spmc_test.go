@@ -440,6 +440,93 @@ func TestHubCloseRaceWithBlockedSender(t *testing.T) {
 	}
 }
 
+func TestCloseBlockedReceiverDoesNotSteal(t *testing.T) {
+	// Closing one of two receivers while it is parked in Recv must wake it
+	// with ErrClosed and must not let it consume the next value the sender
+	// produces — that value must go to the still-open receiver.
+	for i := 0; i < 1000; i++ {
+		h, tx := newHubTx[int](t, 0) // rendezvous
+		rx1 := h.Receiver()
+		rx2 := h.Receiver()
+
+		rx1Done := make(chan error, 1)
+		go func() {
+			_, err := rx1.Recv()
+			rx1Done <- err
+		}()
+		type rx2Result struct {
+			v   int
+			err error
+		}
+		rx2Done := make(chan rx2Result, 1)
+		go func() {
+			v, err := rx2.Recv()
+			rx2Done <- rx2Result{v, err}
+		}()
+
+		rx1.Close()
+		require.NoError(t, tx.Send(42))
+
+		select {
+		case err := <-rx1Done:
+			require.ErrorIsf(t, err, gochan.ErrClosed, "iter %d: closed rx1 stole the value", i)
+		case <-time.After(time.Second):
+			t.Fatalf("iter %d: rx1.Recv never returned (likely stuck because Close did not wake it)", i)
+		}
+		select {
+		case r := <-rx2Done:
+			require.NoErrorf(t, r.err, "iter %d: live rx2 got error", i)
+			require.Equalf(t, 42, r.v, "iter %d", i)
+		case <-time.After(time.Second):
+			t.Fatalf("iter %d: rx2.Recv never returned", i)
+		}
+		h.Close()
+	}
+}
+
+func TestCloseBlockedReceiverContextDoesNotSteal(t *testing.T) {
+	// Same as above for RecvContext.
+	for i := 0; i < 1000; i++ {
+		h, tx := newHubTx[int](t, 0)
+		rx1 := h.Receiver()
+		rx2 := h.Receiver()
+
+		ctx := context.Background()
+		rx1Done := make(chan error, 1)
+		go func() {
+			_, err := rx1.RecvContext(ctx)
+			rx1Done <- err
+		}()
+		type rx2Result struct {
+			v   int
+			err error
+		}
+		rx2Done := make(chan rx2Result, 1)
+		go func() {
+			v, err := rx2.RecvContext(ctx)
+			rx2Done <- rx2Result{v, err}
+		}()
+
+		rx1.Close()
+		require.NoError(t, tx.Send(7))
+
+		select {
+		case err := <-rx1Done:
+			require.ErrorIsf(t, err, gochan.ErrClosed, "iter %d: closed rx1 stole the value", i)
+		case <-time.After(time.Second):
+			t.Fatalf("iter %d: rx1.RecvContext never returned", i)
+		}
+		select {
+		case r := <-rx2Done:
+			require.NoErrorf(t, r.err, "iter %d", i)
+			require.Equalf(t, 7, r.v, "iter %d", i)
+		case <-time.After(time.Second):
+			t.Fatalf("iter %d: rx2.RecvContext never returned", i)
+		}
+		h.Close()
+	}
+}
+
 func TestHubCloseAllowsChanDrain(t *testing.T) {
 	// Recv-style callers see ErrClosed immediately after Hub.Close, but
 	// Chan() consumers can still drain anything buffered before the close —

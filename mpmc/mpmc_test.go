@@ -512,6 +512,94 @@ func TestMultiProducerMultiConsumer(t *testing.T) {
 // TestHubCloseRaceWithBlockedSender stresses Hub.Close vs. a blocked
 // producer parked on `s.ch <- v`. chMu must keep close(s.ch) from racing
 // the send arm.
+func TestCloseBlockedReceiverDoesNotSteal(t *testing.T) {
+	// Closing one of two receivers while it is parked in Recv must wake it
+	// with ErrClosed and must not let it consume the next value a sender
+	// produces — that value must go to the still-open receiver.
+	for i := 0; i < 1000; i++ {
+		h := newHub[int](t, 0) // rendezvous
+		tx := newTx(t, h)
+		rx1 := newRx(t, h)
+		rx2 := newRx(t, h)
+
+		rx1Done := make(chan error, 1)
+		go func() {
+			_, err := rx1.Recv()
+			rx1Done <- err
+		}()
+		type rx2Result struct {
+			v   int
+			err error
+		}
+		rx2Done := make(chan rx2Result, 1)
+		go func() {
+			v, err := rx2.Recv()
+			rx2Done <- rx2Result{v, err}
+		}()
+
+		rx1.Close()
+		require.NoError(t, tx.Send(42))
+
+		select {
+		case err := <-rx1Done:
+			require.ErrorIsf(t, err, gochan.ErrClosed, "iter %d: closed rx1 stole the value", i)
+		case <-time.After(time.Second):
+			t.Fatalf("iter %d: rx1.Recv never returned (likely stuck because Close did not wake it)", i)
+		}
+		select {
+		case r := <-rx2Done:
+			require.NoErrorf(t, r.err, "iter %d: live rx2 got error", i)
+			require.Equalf(t, 42, r.v, "iter %d", i)
+		case <-time.After(time.Second):
+			t.Fatalf("iter %d: rx2.Recv never returned", i)
+		}
+		h.Close()
+	}
+}
+
+func TestCloseBlockedReceiverContextDoesNotSteal(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		h := newHub[int](t, 0)
+		tx := newTx(t, h)
+		rx1 := newRx(t, h)
+		rx2 := newRx(t, h)
+
+		ctx := context.Background()
+		rx1Done := make(chan error, 1)
+		go func() {
+			_, err := rx1.RecvContext(ctx)
+			rx1Done <- err
+		}()
+		type rx2Result struct {
+			v   int
+			err error
+		}
+		rx2Done := make(chan rx2Result, 1)
+		go func() {
+			v, err := rx2.RecvContext(ctx)
+			rx2Done <- rx2Result{v, err}
+		}()
+
+		rx1.Close()
+		require.NoError(t, tx.Send(7))
+
+		select {
+		case err := <-rx1Done:
+			require.ErrorIsf(t, err, gochan.ErrClosed, "iter %d: closed rx1 stole the value", i)
+		case <-time.After(time.Second):
+			t.Fatalf("iter %d: rx1.RecvContext never returned", i)
+		}
+		select {
+		case r := <-rx2Done:
+			require.NoErrorf(t, r.err, "iter %d", i)
+			require.Equalf(t, 7, r.v, "iter %d", i)
+		case <-time.After(time.Second):
+			t.Fatalf("iter %d: rx2.RecvContext never returned", i)
+		}
+		h.Close()
+	}
+}
+
 func TestHubCloseRaceWithBlockedSender(t *testing.T) {
 	for i := 0; i < 2000; i++ {
 		h := newHub[int](t, 1)

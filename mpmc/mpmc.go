@@ -101,7 +101,6 @@ type shared[T any] struct {
 	rxCount int        // number of still-open receivers
 
 	send chancore.BufferedSend[T]
-	recv chancore.BufferedRecv[T]
 }
 
 // Hub is the construction handle for an mpmc pipeline. Use [Hub.Sender]
@@ -121,12 +120,12 @@ type Sender[T any] struct {
 }
 
 // Receiver is a receive-side handle of an mpmc pipeline. Obtain receivers
-// via [Hub.Receiver]. Each receiver is owned by a single consumer
-// goroutine; the closed flag is only touched by that owner so no atomic
-// is required.
+// via [Hub.Receiver]. Each receiver carries its own done signal so that
+// closing one parked receiver wakes only that goroutine (and prevents it
+// from consuming a value that should go to a still-open peer).
 type Receiver[T any] struct {
-	s      *shared[T]
-	closed bool
+	s    *shared[T]
+	done chancore.CloseOnce
 }
 
 // New creates a fresh mpmc Hub backed by a buffered Go channel of
@@ -154,11 +153,6 @@ func New[T any](capacity int) *Hub[T] {
 		ChClosed:  &s.chClosed,
 		SendLock:  s.chMu.RLocker(),
 		CloseLock: &s.chMu,
-	}
-	s.recv = chancore.BufferedRecv[T]{
-		Ch:    s.ch,
-		Dead:  s.dead.Done(),
-		Ready: &s.txReady,
 	}
 	return &Hub[T]{s: s}
 }
@@ -190,12 +184,15 @@ func (h *Hub[T]) Receiver() *Receiver[T] {
 	s := h.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	rx := &Receiver[T]{s: s}
+	rx.done.Init()
 	if s.dead.IsClosed() || (s.rxReady.IsClosed() && s.rxCount == 0) {
-		return &Receiver[T]{s: s, closed: true}
+		rx.done.Close()
+		return rx
 	}
 	s.rxCount++
 	s.rxReady.Close()
-	return &Receiver[T]{s: s}
+	return rx
 }
 
 // Close closes the hub by closing every live receiver and every live
@@ -272,11 +269,26 @@ func (tx *Sender[T]) Close() {
 // empty and every sender has closed, this receiver is closed, or the
 // hub has been closed.
 func (rx *Receiver[T]) Recv() (T, error) {
-	if rx.closed {
-		var z T
+	var z T
+	s := rx.s
+	select {
+	case <-rx.done.Done():
 		return z, gochan.ErrClosed
+	case <-s.dead.Done():
+		return z, gochan.ErrClosed
+	default:
 	}
-	return rx.s.recv.Recv()
+	select {
+	case <-rx.done.Done():
+		return z, gochan.ErrClosed
+	case <-s.dead.Done():
+		return z, gochan.ErrClosed
+	case v, ok := <-s.ch:
+		if !ok {
+			return z, gochan.ErrClosed
+		}
+		return v, nil
+	}
 }
 
 // TryRecv is non-blocking. Returns the next value if one is buffered,
@@ -285,21 +297,62 @@ func (rx *Receiver[T]) Recv() (T, error) {
 // still open, or [gochan.ErrClosed] if the buffer is empty and every
 // sender has closed (or this receiver/the hub is closed).
 func (rx *Receiver[T]) TryRecv() (T, error) {
-	if rx.closed {
-		var z T
+	var z T
+	s := rx.s
+	select {
+	case <-rx.done.Done():
 		return z, gochan.ErrClosed
+	case <-s.dead.Done():
+		return z, gochan.ErrClosed
+	default:
 	}
-	return rx.s.recv.TryRecv()
+	select {
+	case v, ok := <-s.ch:
+		if !ok {
+			return z, gochan.ErrClosed
+		}
+		return v, nil
+	default:
+	}
+	if !s.txReady.IsClosed() {
+		return z, gochan.ErrNotReady
+	}
+	return z, gochan.ErrEmpty
 }
 
 // RecvContext blocks like Recv but returns ctx.Err() if ctx is cancelled
 // first. Cancellation does not close this receiver.
 func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
-	if rx.closed {
-		var z T
+	var z T
+	s := rx.s
+	select {
+	case <-rx.done.Done():
 		return z, gochan.ErrClosed
+	case <-s.dead.Done():
+		return z, gochan.ErrClosed
+	default:
 	}
-	return rx.s.recv.RecvContext(ctx)
+	select {
+	case v, ok := <-s.ch:
+		if !ok {
+			return z, gochan.ErrClosed
+		}
+		return v, nil
+	default:
+	}
+	select {
+	case <-rx.done.Done():
+		return z, gochan.ErrClosed
+	case <-s.dead.Done():
+		return z, gochan.ErrClosed
+	case v, ok := <-s.ch:
+		if !ok {
+			return z, gochan.ErrClosed
+		}
+		return v, nil
+	case <-ctx.Done():
+		return z, ctx.Err()
+	}
 }
 
 // Chan returns the underlying receive-only channel, shared across all
@@ -317,10 +370,9 @@ func (rx *Receiver[T]) Chan() <-chan T { return rx.s.ch }
 // Senders only observe ErrClosed once every receiver has been closed
 // (or the hub itself has been closed). Idempotent.
 func (rx *Receiver[T]) Close() {
-	if rx.closed {
+	if !rx.done.Close() {
 		return
 	}
-	rx.closed = true
 	s := rx.s
 	s.mu.Lock()
 	s.rxCount--

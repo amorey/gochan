@@ -13,7 +13,7 @@ Go channels are extremely useful but they only ship with one type - mpmc (multip
 | `spmc`      | 1       | many      | Work distribution: each item goes to *one* receiver.       |
 | `mpsc`      | many    | 1         | Fan-in: multiple-producer / single-consumer.               |
 | `mpmc`      | many    | many      | General load-balanced queue.                               |
-| `broadcast` | many    | many      | Fan-out: every item delivered to *every* active receiver.  |
+| `broadcast` | 1       | many      | Fan-out: every item delivered to *every* active receiver.  |
 | `watch`     | 1       | many      | Latest-value-only, new sends overwrite unread ones.        |
 
 ## Installation
@@ -22,7 +22,7 @@ Go channels are extremely useful but they only ship with one type - mpmc (multip
 go get github.com/amorey/gochan
 ```
 
-Each architecture lives in its own subpackage; import the ones you need:
+Each architecture lives in its own subpackage:
 
 ```go
 import (
@@ -35,7 +35,7 @@ Requires Go 1.21+.
 
 ## Basic Usage
 
-**Oneshot** — return a value from a goroutine:
+**Oneshot** — return a singl value from a goroutine:
 
 ```go
 tx, rx, closeAll := oneshot.New[Result]()
@@ -45,7 +45,7 @@ go func() { tx.Send(compute()) }()
 result, _ := rx.Recv()
 ```
 
-**SPSC** — stream values between a single producer and consumer:
+**SPSC** — stream values between a single producer and a single consumer:
 
 ```go
 tx, rx, closeAll := spsc.New[int](64)

@@ -41,15 +41,15 @@ type shared[T any] struct {
 	// writePos happens-after the slot write, and a concurrent atomic
 	// load that observes the new writePos transitively observes the
 	// slot write too.
-	writePos  atomic.Uint64
-	txClosed  atomic.Bool
-	hubClosed atomic.Bool // Hub.Close was called — gates future Receiver()
+	writePos atomic.Uint64
+	txClosed atomic.Bool
 
 	mu        sync.Mutex
 	buf       []T
 	notify    chan struct{} // closed (and replaced) on every state change
 	receivers map[*Receiver[T]]struct{}
-	waiters   int // parked receivers; gates notify-channel allocation
+	waiters   int  // parked receivers; gates notify-channel allocation
+	hubClosed bool // accessed only under mu
 
 	// minPos / minCount / minStale form an incremental "minimum
 	// receiver position" tracker so [Sender.TrySend] can decide
@@ -93,15 +93,17 @@ func (s *shared[T]) recomputeMinLocked() {
 	s.minStale = false
 }
 
-// noteAdvanceLocked is called when a receiver's pos increases. If the
-// receiver was at minPos and was the last one there, the tracker is
-// marked stale. Caller must hold s.mu.
-func (s *shared[T]) noteAdvanceLocked(oldPos uint64) {
-	if oldPos == s.minPos {
-		s.minCount--
-		if s.minCount == 0 {
-			s.minStale = true
-		}
+// leaveMinCohortLocked decrements the cohort at minPos when a
+// receiver at that position either advances or closes. When the
+// cohort empties the tracker is marked stale and the next TrySend
+// triggers a single O(N) recompute. Caller must hold s.mu.
+func (s *shared[T]) leaveMinCohortLocked(oldPos uint64) {
+	if s.minStale || oldPos != s.minPos {
+		return
+	}
+	s.minCount--
+	if s.minCount == 0 {
+		s.minStale = true
 	}
 }
 
@@ -121,7 +123,7 @@ type Sender[T any] struct{ s *shared[T] }
 type Receiver[T any] struct {
 	s    *shared[T]
 	pos  uint64
-	done *chancore.CloseOnce
+	done chancore.CloseOnce
 
 	chOnce sync.Once
 	ch     chan T
@@ -153,12 +155,9 @@ func (h *Hub[T]) Receiver() gochan.Receiver[T] {
 	s := h.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rx := &Receiver[T]{
-		s:    s,
-		pos:  s.writePos.Load(),
-		done: chancore.NewCloseOnce(),
-	}
-	if s.hubClosed.Load() || s.txClosed.Load() {
+	rx := &Receiver[T]{s: s, pos: s.writePos.Load()}
+	rx.done.Init()
+	if s.hubClosed || s.txClosed.Load() {
 		rx.done.Close()
 		return rx
 	}
@@ -182,18 +181,19 @@ func (h *Hub[T]) Close() {
 	s := h.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.hubClosed.Load() {
+	if s.hubClosed {
 		return
 	}
-	s.hubClosed.Store(true)
+	s.hubClosed = true
 	s.txClosed.Store(true)
+	// Closing each receiver's done wakes its parked Recv directly,
+	// so there's no need to also fire the shared notify channel.
 	for rx := range s.receivers {
 		rx.done.Close()
 	}
-	s.receivers = make(map[*Receiver[T]]struct{})
+	s.receivers = nil
 	s.minCount = 0
 	s.minStale = false
-	s.signalLocked()
 }
 
 func (tx *Sender[T]) Send(v T) error {
@@ -350,7 +350,7 @@ func (rx *Receiver[T]) tryReadLocked() (T, error) {
 			missed := oldest - rx.pos
 			oldPos := rx.pos
 			rx.pos = oldest
-			s.noteAdvanceLocked(oldPos)
+			s.leaveMinCohortLocked(oldPos)
 			return z, gochan.ErrLagged{Missed: missed}
 		}
 	}
@@ -358,7 +358,7 @@ func (rx *Receiver[T]) tryReadLocked() (T, error) {
 		v := s.buf[rx.pos%s.capacity]
 		oldPos := rx.pos
 		rx.pos++
-		s.noteAdvanceLocked(oldPos)
+		s.leaveMinCohortLocked(oldPos)
 		return v, nil
 	}
 	return z, gochan.ErrEmpty
@@ -413,10 +413,5 @@ func (rx *Receiver[T]) Close() {
 		return
 	}
 	delete(s.receivers, rx)
-	if !s.minStale && rx.pos == s.minPos {
-		s.minCount--
-		if s.minCount == 0 {
-			s.minStale = true
-		}
-	}
+	s.leaveMinCohortLocked(rx.pos)
 }

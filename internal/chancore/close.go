@@ -14,8 +14,16 @@ type CloseOnce struct {
 
 // NewCloseOnce returns a CloseOnce whose done channel is not yet closed.
 func NewCloseOnce() *CloseOnce {
-	return &CloseOnce{ch: make(chan struct{})}
+	c := &CloseOnce{}
+	c.Init()
+	return c
 }
+
+// Init prepares an embedded CloseOnce for use. Call once on a
+// zero-valued CloseOnce before any other method. Useful when the
+// CloseOnce lives as a value field inside another struct, saving
+// the separate heap allocation that [NewCloseOnce] would incur.
+func (c *CloseOnce) Init() { c.ch = make(chan struct{}) }
 
 // Close closes the done channel iff this is the first successful call.
 // Returns true if this call performed the close.

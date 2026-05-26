@@ -114,12 +114,21 @@ func TestReceiverCloseBeforeSend(t *testing.T) {
 
 func TestReceiverCloseUnblocksRecv(t *testing.T) {
 	_, rx, _ := newPair[int](t)
+	started := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		time.Sleep(20 * time.Millisecond)
-		rx.Close()
+		close(started)
+		_, err := rx.Recv()
+		done <- err
 	}()
-	_, err := rx.Recv()
-	assert.ErrorIs(t, err, gochan.ErrClosed)
+	<-started
+	rx.Close()
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, gochan.ErrClosed)
+	case <-time.After(time.Second):
+		t.Fatal("Recv did not return after Close")
+	}
 }
 
 func TestReceiverCloseIdempotent(t *testing.T) {
@@ -188,12 +197,14 @@ func TestRecvContextCancel(t *testing.T) {
 
 func TestRecvContextSucceeds(t *testing.T) {
 	tx, rx, _ := newPair[int](t)
+	recving := make(chan struct{})
 	go func() {
-		time.Sleep(20 * time.Millisecond)
+		<-recving
 		_ = tx.Send(9)
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
+	close(recving)
 	v, err := rx.RecvContext(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 9, v)
@@ -275,12 +286,21 @@ func TestSendRecvCloseRace(t *testing.T) {
 
 func TestKillBeforeSendUnblocksRecv(t *testing.T) {
 	_, rx, kill := newPair[int](t)
+	started := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		time.Sleep(20 * time.Millisecond)
-		kill()
+		close(started)
+		_, err := rx.Recv()
+		done <- err
 	}()
-	_, err := rx.Recv()
-	assert.ErrorIs(t, err, gochan.ErrClosed)
+	<-started
+	kill()
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, gochan.ErrClosed)
+	case <-time.After(time.Second):
+		t.Fatal("Recv did not return after kill")
+	}
 }
 
 func TestKillAfterSendDropsValue(t *testing.T) {

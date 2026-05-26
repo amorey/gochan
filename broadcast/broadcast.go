@@ -97,7 +97,7 @@
 //	    tx.Close()
 //	}()
 //
-//	rx := hub.Receiver().(*broadcast.Receiver[Metric])
+//	rx := hub.Receiver()
 //	for {
 //	    m, err := rx.Recv()
 //	    var lagged gochan.ErrLagged

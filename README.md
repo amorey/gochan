@@ -253,10 +253,10 @@ All three are idempotent. The close-all inherits the sender's close discipline â
 A small set of sentinel errors is shared across all packages:
 
 ```go
-var ErrClosed   = errors.New("chans: channel closed")
-var ErrFull     = errors.New("chans: channel full")
-var ErrEmpty    = errors.New("chans: channel empty")
-var ErrNotReady = errors.New("chans: no counterparty registered")
+var ErrClosed   = errors.New("gochan: channel closed")
+var ErrFull     = errors.New("gochan: channel full")
+var ErrEmpty    = errors.New("gochan: channel empty")
+var ErrNotReady = errors.New("gochan: no counterparty registered")
 
 type ErrLagged struct{ Missed uint64 }  // broadcast only
 ```

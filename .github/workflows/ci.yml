@@ -44,10 +44,13 @@ jobs:
     strategy:
       matrix:
         go-version: *go-versions
+        gomaxprocs: [1, 2, 8]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
       - name: Run tests
+        env:
+          GOMAXPROCS: ${{ matrix.gomaxprocs }}
         run: go test -race ./...

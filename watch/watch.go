@@ -176,13 +176,12 @@ func (h *Hub[T]) Receiver() *Receiver[T] {
 	return rx
 }
 
-// Close closes the sender and locks out future [Hub.Receiver] calls.
-// Live receivers that have not yet observed the latest value may
-// still receive it once via Recv / TryRecv / Chan before subsequent
-// operations return [gochan.ErrClosed]; receivers already caught up
-// see ErrClosed immediately. Future Sender calls return the closed
-// singleton; future Receiver calls return handles that deliver the
-// final value once and then ErrClosed. Idempotent.
+// Close closes the sender. Live receivers that have not yet observed
+// the latest value may still receive it once via Recv / TryRecv / Chan
+// before subsequent operations return [gochan.ErrClosed]; receivers
+// already caught up see ErrClosed immediately. Future Sender calls
+// return the closed singleton; future Receiver calls return handles
+// that deliver the final value once and then ErrClosed. Idempotent.
 func (h *Hub[T]) Close() { h.tx.Close() }
 
 // Send publishes v as the new current value. Never blocks. If a

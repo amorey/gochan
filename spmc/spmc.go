@@ -6,11 +6,12 @@
 // exactly like a Go buffered channel: New[T](0) is a rendezvous
 // channel, New[T](n) allows n queued values before Send blocks.
 //
-// Exactly one goroutine should call Send/Close on the sender; [Hub.Receiver]
-// is safe to call from any goroutine. Each *Receiver[T] is intended for
-// use by a single consumer goroutine. [Hub.Close] calls Close on the
-// sender and on every live receiver — don't call it concurrently with an
-// active Send from a different goroutine.
+// The send-side handle returned by [Hub.Sender] is a singleton that is
+// safe to share across goroutines: Send, TrySend, SendContext, and Close
+// may all be called concurrently from any number of publishers.
+// [Hub.Receiver] is safe to call from any goroutine, but each *Receiver[T]
+// is intended for use by a single consumer goroutine. [Hub.Close] calls
+// Close on the sender and on every live receiver.
 package spmc
 
 import (
@@ -150,10 +151,8 @@ func (tx *Sender[T]) SendContext(ctx context.Context, v T) error {
 
 // Close closes the sender. Already-queued values remain receivable via
 // Recv and Chan; receivers drain them in order before observing
-// [gochan.ErrClosed]. Further Send calls return ErrClosed. Idempotent.
-// Intended to be called by the single producer — spmc does not
-// synchronize concurrent callers on the sender side (though Hub.Receiver
-// is safe to call from any goroutine).
+// [gochan.ErrClosed]. Further Send calls return ErrClosed. Idempotent
+// and safe to call concurrently with Send on any goroutine.
 func (tx *Sender[T]) Close() { tx.s.send.CloseCh(&tx.s.sendMu) }
 
 // Recv blocks until a value is available to this receiver. Returns the

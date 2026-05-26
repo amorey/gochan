@@ -246,7 +246,7 @@ var ErrFull     = errors.New("chans: channel full")
 var ErrEmpty    = errors.New("chans: channel empty")
 var ErrNotReady = errors.New("chans: no counterparty registered")
 
-type ErrLagged struct{ Skipped uint64 }  // broadcast only
+type ErrLagged struct{ Missed uint64 }  // broadcast only
 ```
 
 `ErrNotReady` is returned by `TrySend` on packages with multi-side fan-out (`spmc`, `mpmc`) before any receiver has been registered, and by `TryRecv` on multi-side fan-in (`mpsc`, `mpmc`) before any sender has been registered. It distinguishes "the other side hasn't shown up yet" (a lifecycle/config condition) from `ErrFull` / `ErrEmpty` (transient buffer pressure). After the first registration on each side the regular `ErrFull` / `ErrEmpty` semantics apply.
@@ -444,11 +444,11 @@ func (h *Hub[T]) Close()
 
 <dl>
   <dt><code>Sender() gochan.Sender[T]</code></dt>
-  <dd>Returns the singleton send-side handle. Repeated calls return the same handle. After the hub has been closed (explicitly via <code>Hub.Close</code>, or implicitly because every previously-registered receiver has already closed) the returned handle reports <code>ErrClosed</code> on use.</dd>
+  <dd>Returns the singleton send-side handle. Repeated calls return the same handle. The handle is safe to share across goroutines — <code>Send</code>, <code>TrySend</code>, <code>SendContext</code>, and <code>Close</code> may all be called concurrently from any number of publishers. After the hub has been closed (explicitly via <code>Hub.Close</code>, or implicitly because every previously-registered receiver has already closed) the returned handle reports <code>ErrClosed</code> on use.</dd>
   <dt id="spmc-receiver"><code>Receiver() gochan.Receiver[T]</code></dt>
   <dd>Returns a new receiver bound to the shared queue. Use this to add workers to the consumer pool. Each returned receiver has its own independent <code>Close</code> state but shares the queue and sender-close signal with every other receiver. Safe to call concurrently. If the hub has been closed (or every previously-registered receiver has already been closed) the returned handle is pre-closed and reports <code>ErrClosed</code> on use.</dd>
   <dt><code>Close()</code></dt>
-  <dd>Equivalent to calling <code>Close</code> on every live receiver and on the sender (receivers first so an in-flight <code>Send</code> escapes via the dead signal before the underlying channel is closed). For <code>Recv</code>-style callers buffered values are abandoned; <code>Chan</code> consumers can drain them before seeing channel-closed. Future <code>Sender</code> calls return the (now-closed) singleton handle and future <code>Receiver</code> calls return pre-closed handles. Idempotent. Inherits the sender's close discipline — don't call concurrently with an active <code>Send</code> from a different goroutine.</dd>
+  <dd>Equivalent to calling <code>Close</code> on every live receiver and on the sender (receivers first so an in-flight <code>Send</code> escapes via the dead signal before the underlying channel is closed). For <code>Recv</code>-style callers buffered values are abandoned; <code>Chan</code> consumers can drain them before seeing channel-closed. Future <code>Sender</code> calls return the (now-closed) singleton handle and future <code>Receiver</code> calls return pre-closed handles. Idempotent and safe to call concurrently with <code>Send</code> on any goroutine.</dd>
 </dl>
 
 **Sender**
@@ -497,8 +497,8 @@ func (rx *Receiver[T]) Close()
 **Semantics**
 
 <dl>
-  <dt>Single producer / multi consumer</dt>
-  <dd>Exactly one goroutine should call <code>Send</code>/<code>Close</code> on the sender. Any number of goroutines may each hold their own <code>*Receiver[T]</code> (obtained from <code>hub.Receiver()</code>) and call <code>Recv</code>/<code>Close</code> on it. The implementation does not synchronize concurrent callers on the <em>same</em> receiver handle — call <code>hub.Receiver()</code> once per worker.</dd>
+  <dt>Shared singleton sender, multi consumer</dt>
+  <dd>The send-side handle returned by <code>hub.Sender()</code> is a singleton that is safe to share across goroutines: any number of publishers may call <code>Send</code> / <code>TrySend</code> / <code>SendContext</code> / <code>Close</code> concurrently on the same handle. Any number of goroutines may each hold their own <code>*Receiver[T]</code> (obtained from <code>hub.Receiver()</code>) and call <code>Recv</code>/<code>Close</code> on it; the implementation does not synchronize concurrent callers on the <em>same</em> receiver handle — call <code>hub.Receiver()</code> once per worker.</dd>
   <dt>Each value to exactly one receiver</dt>
   <dd>Values are <em>not</em> broadcast. A <code>Send</code> deposits one value into the shared queue, and the next <code>Recv</code> on any receiver removes it. Choice of receiver is non-deterministic and not guaranteed to be fair — it follows Go's channel-receive scheduling.</dd>
   <dt>FIFO ordering across the queue</dt>
@@ -722,5 +722,179 @@ func (rx *Receiver[T]) Close()
 </dl>
 
 #### broadcast
+
+A single-producer fan-out channel backed by a fixed-size ring buffer.
+One `Sender` publishes values to any number of `Receiver`s, with every
+value delivered to *every* live receiver (unlike `spmc`/`mpmc`, which
+deliver each value to one receiver). The ring is bounded; slow receivers
+don't block the sender — instead, the sender overwrites the oldest unread
+slot and the lagging receiver gets a single [`gochan.ErrLagged`](#errors)
+on its next `Recv` (telling it how many values it missed) before resuming
+from the oldest still-buffered value.
+
+Typical uses: event-stream fan-out (one producer, many listeners),
+configuration-change notifications, market-data ticks distributed to many
+strategies, WebSocket / SSE push systems where slow clients must not
+back up the publisher.
+
+Unlike `spmc`/`mpmc`, every receiver sees every value (unless there's lag).
+Unlike `watch`, values are buffered (you see the last N, not just the
+most recent).
+
+**Constructor**
+
+```go
+func New[T any](capacity int) *Hub[T]
+```
+
+<dl>
+  <dt><code>New[T](capacity)</code></dt>
+  <dd>Creates a fresh broadcast hub backed by a ring buffer of the given <code>capacity</code>. <code>capacity &lt;= 0</code> panics: a ring of size 0 cannot hold a value across a sender→receiver handoff without blocking the sender, which contradicts the package's non-blocking promise. Pick a capacity that comfortably exceeds the burst size you expect between the sender and the slowest acceptable receiver — exceed it and that receiver will see <code>ErrLagged</code>.</dd>
+</dl>
+
+A freshly constructed broadcast hub has no receivers. Unlike <code>spmc</code> and <code>mpmc</code>, <code>Send</code> does <em>not</em> wait for a receiver to register — broadcast is "fire and forget" and the ring buffer accepts writes regardless of subscribers. Values written before the first <a href="#broadcast-receiver"><code>hub.Receiver()</code></a> call are not delivered to anyone: new receivers start at the current write position and only see values published after their registration. <code>ErrNotReady</code> is not produced by this package.
+
+**Hub**
+
+```go
+func (h *Hub[T]) Sender()   gochan.Sender[T]
+func (h *Hub[T]) Receiver() gochan.Receiver[T]
+func (h *Hub[T]) Close()
+```
+
+<dl>
+  <dt><code>Sender() gochan.Sender[T]</code></dt>
+  <dd>Returns the singleton send-side handle. Repeated calls return the same handle. The handle is safe to share across goroutines — <code>Send</code>, <code>TrySend</code>, <code>SendContext</code>, and <code>Close</code> may all be called concurrently from any number of publishers. After the hub has been closed the returned handle reports <code>ErrClosed</code> on use.</dd>
+  <dt id="broadcast-receiver"><code>Receiver() gochan.Receiver[T]</code></dt>
+  <dd>Returns a new subscriber bound to the ring. The receiver's read position is set to the sender's current write position, so it sees only values published <em>after</em> this call — historical values still in the ring are not replayed. Each receiver has its own independent <code>Close</code> state and lag accounting. Safe to call concurrently. If the hub has been closed the returned handle is pre-closed and reports <code>ErrClosed</code> on use.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Equivalent to calling <code>Close</code> on the sender and on every live receiver. Receivers may still drain values that were written before the hub closed (subject to lag); subsequent <code>Recv</code> returns <code>ErrClosed</code> after the receiver catches up. Future <code>Sender</code> calls return the (now-closed) singleton; future <code>Receiver</code> calls return pre-closed handles. Idempotent.</dd>
+</dl>
+
+**Sender**
+
+```go
+func (tx *Sender[T]) Send(v T) error
+func (tx *Sender[T]) TrySend(v T) error
+func (tx *Sender[T]) SendContext(ctx context.Context, v T) error
+func (tx *Sender[T]) Close()
+```
+
+<dl>
+  <dt><code>Send(v) error</code></dt>
+  <dd>Publishes <code>v</code> to the ring and returns immediately. <code>Send</code> never blocks: if the ring is full of unread values, the oldest unread slot is overwritten and the receiver(s) holding that slot will see <code>ErrLagged</code> on their next <code>Recv</code>. Returns <code>ErrClosed</code> if the sender or hub has been closed; on <code>ErrClosed</code> the value is dropped.</dd>
+  <dt><code>TrySend(v) error</code></dt>
+  <dd>Pressure-aware variant. Returns <code>ErrFull</code> — <em>without writing</em> — if publishing the value would evict an unread value from at least one live receiver. Returns <code>ErrClosed</code> if closed. Returns <code>nil</code> on a successful write. <code>TrySend</code> is the entry point for senders that want to observe subscriber lag (for metrics, back-pressure, or self-throttling) or implement a drop-newest policy on top of the package's default drop-oldest behavior — see <a href="#broadcast-patterns">Patterns</a> below.</dd>
+  <dt><code>SendContext(ctx, v) error</code></dt>
+  <dd>Returns <code>ctx.Err()</code> if <code>ctx</code> is already cancelled; otherwise identical to <code>Send</code>. Because <code>Send</code> never blocks, there is nothing for the context to interrupt mid-call — this method exists for interface symmetry with the rest of the library.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Closes the sender. Already-published values remain in the ring and remain receivable (subject to lag) until each receiver catches up. Further <code>Send</code> / <code>TrySend</code> / <code>SendContext</code> calls return <code>ErrClosed</code>. Idempotent.</dd>
+</dl>
+
+**Receiver**
+
+```go
+func (rx *Receiver[T]) Recv() (T, error)
+func (rx *Receiver[T]) TryRecv() (T, error)
+func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error)
+func (rx *Receiver[T]) Chan() <-chan T
+func (rx *Receiver[T]) Close()
+```
+
+<dl>
+  <dt><code>Recv() (T, error)</code></dt>
+  <dd>Blocks until the next value is available at this receiver's position, the sender has closed and this receiver has caught up, or this receiver/the hub is closed. Returns the next value, or one of:
+    <ul>
+      <li><code>gochan.ErrLagged</code> — the receiver fell more than <em>capacity</em> values behind the sender; some values were overwritten. The error carries <code>Missed</code> — the number of values dropped before the receiver caught up. The receiver's position is reset to the oldest still-buffered value; the next <code>Recv</code> resumes from there. The receiver is still usable.</li>
+      <li><code>gochan.ErrClosed</code> — the sender or hub has closed and this receiver has already drained everything still in the ring at or after its position.</li>
+    </ul>
+  </dd>
+  <dt><code>TryRecv() (T, error)</code></dt>
+  <dd>Non-blocking. Returns the next value if one is available at this receiver's position; <code>ErrEmpty</code> if the receiver is caught up to the sender; <code>gochan.ErrLagged</code> if the receiver has fallen behind (same semantics as <code>Recv</code>); or <code>ErrClosed</code> if the receiver/hub is closed.</dd>
+  <dt><code>RecvContext(ctx) (T, error)</code></dt>
+  <dd>Like <code>Recv</code> but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled first. A ready value or <code>ErrLagged</code> is preferred over a cancelled context.</dd>
+  <dt><code>Chan() &lt;-chan T</code></dt>
+  <dd>Returns a per-receiver native channel that yields successive values in order. The channel is fed by the receiver and silently advances past lagged values — <code>ErrLagged</code> cannot be reported through a plain <code>&lt;-chan T</code>, so the channel pretends the dropped values never existed (i.e., the consumer sees the same value sequence as if it had called <code>Recv</code> in a loop and ignored <code>ErrLagged</code>). Use <code>Recv</code> / <code>TryRecv</code> / <code>RecvContext</code> instead if you need to observe lag. The channel is closed when the sender has closed and this receiver has drained the ring. Each receiver has its own channel; repeated calls on the same receiver return the same channel.</dd>
+  <dt><code>Close()</code></dt>
+  <dd>Closes this receiver only. Other receivers and the sender are unaffected. Subsequent <code>Recv</code> / <code>TryRecv</code> / <code>RecvContext</code> calls return <code>ErrClosed</code>. Idempotent. Closing the last receiver does <em>not</em> close the sender — broadcast lets the sender keep publishing into the ring with no subscribers (matches the "fire and forget" model).</dd>
+</dl>
+
+**Semantics**
+
+<dl>
+  <dt>Shared singleton sender, fan-out delivery</dt>
+  <dd>The send-side handle returned by <code>hub.Sender()</code> is a singleton that is safe to share across goroutines: any number of publishers may call <code>Send</code> / <code>TrySend</code> / <code>SendContext</code> / <code>Close</code> concurrently on the same handle. Any number of goroutines may each hold their own <code>*Receiver[T]</code> (obtained from <code>hub.Receiver()</code>) and call <code>Recv</code>/<code>Close</code> on it; the implementation does not synchronize concurrent callers on the <em>same</em> receiver handle — call <code>hub.Receiver()</code> once per subscriber. Every value goes to <em>every</em> live receiver — this is fan-out, not load distribution. Use <code>spmc</code> or <code>mpmc</code> if you want each value delivered to exactly one consumer.</dd>
+  <dt>Drop-oldest, with sender-observable pressure</dt>
+  <dd>The ring buffer holds at most <em>capacity</em> values. When <code>Send</code> wraps around onto a slot still holding an unread value, the unread value is overwritten and the affected receiver(s) see <code>ErrLagged</code> on their next <code>Recv</code>. <code>TrySend</code> exposes the same condition to the publisher: it returns <code>ErrFull</code> and refuses to write when an overwrite would occur, letting publishers self-throttle or drop-newest if they prefer.</dd>
+  <dt>Late subscribers see only future values</dt>
+  <dd>A <code>Receiver</code> obtained via <code>hub.Receiver()</code> starts at the sender's current write position. Values published before registration are not replayed. To make a value durable across a subscribe boundary, publish it again after subscription completes.</dd>
+  <dt>Sender Send never blocks</dt>
+  <dd>By design, <code>Send</code> always returns immediately (success, overwrite, or <code>ErrClosed</code>). This is the inverse of the queue-style packages, where <code>Send</code> blocks under backpressure. If you want backpressure here, use <code>TrySend</code> + a back-off loop, or use <code>mpmc</code> instead.</dd>
+  <dt>No empty-hub gating</dt>
+  <dd>Unlike <code>spmc</code> / <code>mpmc</code>, broadcast does not block <code>Send</code> on the first <code>Hub.Receiver()</code> call. Values published with no subscribers are written to the ring but never delivered — subsequent subscribers start at "now" and don't see them. This package therefore never returns <code>ErrNotReady</code>.</dd>
+  <dt>Hub close-all</dt>
+  <dd><code>Hub.Close()</code> closes the sender and every live receiver. Recv-style callers can drain anything they had not yet consumed at the time of close (subject to lag) before seeing <code>ErrClosed</code>; <code>Chan</code> consumers see the channel close after their drain. The sender's view of close is immediate.</dd>
+</dl>
+
+<h5 id="broadcast-patterns">Patterns</h5>
+
+Fire-and-forget telemetry — publisher doesn't care about lag, subscribers handle it:
+
+```go
+hub := broadcast.New[Metric](1024)
+tx := hub.Sender()
+go func() {
+    for m := range metricStream {
+        tx.Send(m) // never blocks; overwrites on wrap
+    }
+    tx.Close()
+}()
+
+rx := hub.Receiver().(*broadcast.Receiver[Metric])
+for {
+    m, err := rx.Recv()
+    var lagged gochan.ErrLagged
+    switch {
+    case errors.As(err, &lagged):
+        log.Warn("dropped metrics", "missed", lagged.Missed)
+        continue
+    case errors.Is(err, gochan.ErrClosed):
+        return
+    }
+    process(m)
+}
+```
+
+Sender-side observability — publisher tracks subscriber lag without changing delivery:
+
+```go
+for state := range stateStream {
+    if err := tx.TrySend(state); errors.Is(err, gochan.ErrFull) {
+        metrics.Inc("broadcast.subscriber_lagging")
+    }
+    tx.Send(state) // commit anyway — drop-oldest is fine for this stream
+}
+```
+
+User-built drop-newest — preserve older values when the ring is full:
+
+```go
+for evt := range events {
+    if err := tx.TrySend(evt); errors.Is(err, gochan.ErrFull) {
+        droppedCount.Add(1)
+        continue // skip the new value; keep older ones in the ring
+    }
+}
+```
+
+Self-throttling publisher — slow down when subscribers lag:
+
+```go
+for v := range source {
+    for tx.TrySend(v) != nil {
+        time.Sleep(backoff)
+    }
+}
+```
 
 #### watch

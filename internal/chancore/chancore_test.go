@@ -69,11 +69,12 @@ func newSendFixture(capacity int, ready *CloseOnce) (*BufferedSend[int], *CloseO
 	var chClosed atomic.Bool
 	var mu sync.Mutex
 	s := &BufferedSend[int]{
-		Ch:       make(chan int, capacity),
-		Dead:     dead.Done(),
-		Ready:    ready,
-		ChClosed: &chClosed,
-		SendLock: &mu,
+		Ch:        make(chan int, capacity),
+		Dead:      dead.Done(),
+		Ready:     ready,
+		ChClosed:  &chClosed,
+		SendLock:  &mu,
+		CloseLock: &mu,
 	}
 	return s, dead
 }

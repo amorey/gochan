@@ -6,12 +6,14 @@
 // exactly like a Go buffered channel: New[T](0) is a rendezvous
 // channel, New[T](n) allows n queued values before Send blocks.
 //
-// The send-side handle returned by [Hub.Sender] is a singleton that is
-// safe to share across goroutines: Send, TrySend, SendContext, and Close
-// may all be called concurrently from any number of publishers.
-// [Hub.Receiver] is safe to call from any goroutine, but each *Receiver[T]
-// is intended for use by a single consumer goroutine. [Hub.Close] calls
-// Close on the sender and on every live receiver.
+// The send-side handle returned by [Hub.Sender] is a singleton; spmc is
+// single-producer by design, and the implementation does not synchronize
+// concurrent callers on the sender handle — Send/TrySend/SendContext/Close
+// are intended to be driven by one producer goroutine. If you need
+// multiple producers, use [github.com/amorey/gochan/mpmc]. [Hub.Receiver]
+// is safe to call from any goroutine, but each *Receiver[T] is intended
+// for use by a single consumer goroutine. [Hub.Close] calls Close on the
+// sender and on every live receiver.
 //
 // Unlike [github.com/amorey/gochan/broadcast], every value goes to one
 // receiver, not all of them — spmc is load distribution, not fan-out.
@@ -24,14 +26,14 @@
 //
 // # Semantics
 //
-// Shared singleton sender, multi consumer. The send-side handle returned
-// by [Hub.Sender] is a singleton that is safe to share across goroutines:
-// any number of goroutines may call Send / TrySend / SendContext / Close
-// concurrently on the same handle. Any number of goroutines may each hold
-// their own *Receiver[T] (obtained from [Hub.Receiver]) and call
-// Recv/Close on it; the implementation does not synchronize concurrent
-// callers on the same receiver handle — call [Hub.Receiver] once per
-// worker.
+// Single producer, multi consumer. The send-side handle returned by
+// [Hub.Sender] is a singleton intended to be driven by one producer
+// goroutine; the implementation does not synchronize concurrent callers
+// on the sender handle. Any number of goroutines may each hold their
+// own *Receiver[T] (obtained from [Hub.Receiver]) and call Recv/Close
+// on it; the implementation does not synchronize concurrent callers on
+// the same receiver handle — call [Hub.Receiver] once per worker. For
+// multi-producer workloads use [github.com/amorey/gochan/mpmc].
 //
 // Each value to exactly one receiver. Values are not broadcast. A Send
 // deposits one value into the shared queue, and the next Recv on any
@@ -86,8 +88,8 @@ type shared[T any] struct {
 	mu      sync.Mutex // guards the fields below
 	rxCount int        // number of still-open receivers
 
-	rxReady *chancore.CloseOnce // closed when the first Receiver is registered
-	dead    *chancore.CloseOnce // closed when rxCount drops to zero or Hub.Close fires
+	rxReady chancore.CloseOnce // closed when the first Receiver is registered
+	dead    chancore.CloseOnce // closed when rxCount drops to zero or Hub.Close fires
 
 	send chancore.BufferedSend[T]
 	recv chancore.BufferedRecv[T]
@@ -123,17 +125,16 @@ func New[T any](capacity int) *Hub[T] {
 	if capacity < 0 {
 		panic("spmc: negative capacity")
 	}
-	s := &shared[T]{
-		ch:      make(chan T, capacity),
-		rxReady: chancore.NewCloseOnce(),
-		dead:    chancore.NewCloseOnce(),
-	}
+	s := &shared[T]{ch: make(chan T, capacity)}
+	s.rxReady.Init()
+	s.dead.Init()
 	s.send = chancore.BufferedSend[T]{
-		Ch:       s.ch,
-		Dead:     s.dead.Done(),
-		Ready:    s.rxReady,
-		ChClosed: &s.chClosed,
-		SendLock: &s.sendMu,
+		Ch:        s.ch,
+		Dead:      s.dead.Done(),
+		Ready:     &s.rxReady,
+		ChClosed:  &s.chClosed,
+		SendLock:  &s.sendMu,
+		CloseLock: &s.sendMu,
 	}
 	s.recv = chancore.BufferedRecv[T]{
 		Ch:   s.ch,
@@ -143,9 +144,12 @@ func New[T any](capacity int) *Hub[T] {
 }
 
 // Sender returns the singleton send-side handle. Repeated calls return
-// the same handle. If the hub has been closed (explicitly or because
-// every previously-registered receiver has already closed) the returned
-// handle reports [gochan.ErrClosed] on use.
+// the same handle. The handle is intended to be driven by one producer
+// goroutine — spmc is single-producer by design and does not synchronize
+// concurrent callers on the sender; use [github.com/amorey/gochan/mpmc]
+// for multi-producer workloads. If the hub has been closed (explicitly
+// or because every previously-registered receiver has already closed)
+// the returned handle reports [gochan.ErrClosed] on use.
 func (h *Hub[T]) Sender() *Sender[T] { return h.tx }
 
 // Receiver returns a new receive-side handle bound to the shared queue.
@@ -202,9 +206,11 @@ func (tx *Sender[T]) SendContext(ctx context.Context, v T) error {
 
 // Close closes the sender. Already-queued values remain receivable via
 // Recv and Chan; receivers drain them in order before observing
-// [gochan.ErrClosed]. Further Send calls return ErrClosed. Idempotent
-// and safe to call concurrently with Send on any goroutine.
-func (tx *Sender[T]) Close() { tx.s.send.CloseCh(&tx.s.sendMu) }
+// [gochan.ErrClosed]. Further Send calls return ErrClosed. Idempotent.
+// Intended to be called by the producer goroutine that owns this
+// sender — spmc does not synchronize concurrent callers on the sender
+// handle.
+func (tx *Sender[T]) Close() { tx.s.send.CloseCh() }
 
 // Recv blocks until a value is available to this receiver. Returns the
 // next value in the shared FIFO, or [gochan.ErrClosed] if the buffer is

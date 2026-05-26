@@ -92,9 +92,9 @@ type shared[T any] struct {
 	chMu     sync.RWMutex
 	chClosed atomic.Bool
 
-	dead    *chancore.CloseOnce // closed when rxCount drops to zero or Hub.Close fires
-	rxReady *chancore.CloseOnce // closed when the first Receiver is registered
-	txReady *chancore.CloseOnce // closed when the first Sender is registered
+	dead    chancore.CloseOnce // closed when rxCount drops to zero or Hub.Close fires
+	rxReady chancore.CloseOnce // closed when the first Receiver is registered
+	txReady chancore.CloseOnce // closed when the first Sender is registered
 
 	mu      sync.Mutex // guards txCount and rxCount
 	txCount int        // number of still-open senders
@@ -143,23 +143,22 @@ func New[T any](capacity int) *Hub[T] {
 	if capacity < 0 {
 		panic("mpmc: negative capacity")
 	}
-	s := &shared[T]{
-		ch:      make(chan T, capacity),
-		dead:    chancore.NewCloseOnce(),
-		rxReady: chancore.NewCloseOnce(),
-		txReady: chancore.NewCloseOnce(),
-	}
+	s := &shared[T]{ch: make(chan T, capacity)}
+	s.dead.Init()
+	s.rxReady.Init()
+	s.txReady.Init()
 	s.send = chancore.BufferedSend[T]{
-		Ch:       s.ch,
-		Dead:     s.dead.Done(),
-		Ready:    s.rxReady,
-		ChClosed: &s.chClosed,
-		SendLock: s.chMu.RLocker(),
+		Ch:        s.ch,
+		Dead:      s.dead.Done(),
+		Ready:     &s.rxReady,
+		ChClosed:  &s.chClosed,
+		SendLock:  s.chMu.RLocker(),
+		CloseLock: &s.chMu,
 	}
 	s.recv = chancore.BufferedRecv[T]{
 		Ch:    s.ch,
 		Dead:  s.dead.Done(),
-		Ready: s.txReady,
+		Ready: &s.txReady,
 	}
 	return &Hub[T]{s: s}
 }
@@ -211,7 +210,7 @@ func (h *Hub[T]) Close() {
 	s.mu.Lock()
 	s.dead.Close()
 	s.mu.Unlock()
-	s.send.CloseCh(&s.chMu)
+	s.send.CloseCh()
 }
 
 // Send enqueues v, blocking while the buffer is full and (until the
@@ -265,7 +264,7 @@ func (tx *Sender[T]) Close() {
 	if !last {
 		return
 	}
-	s.send.CloseCh(&s.chMu)
+	s.send.CloseCh()
 }
 
 // Recv blocks until a value is available to this receiver. Returns the

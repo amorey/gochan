@@ -36,9 +36,13 @@
 // Shared singleton sender, fan-out delivery. The send-side handle
 // returned by [Hub.Sender] is a singleton that is safe to share across
 // goroutines: any number of publishers may call Send / TrySend /
-// SendContext / Close concurrently on the same handle. Any number of
-// goroutines may each hold their own *Receiver[T] (obtained from
-// [Hub.Receiver]) and call Recv/Close on it; the implementation does
+// SendContext / Close concurrently on the same handle. This is an
+// intentional exception to the "one handle, one goroutine" rule that
+// applies to the queue-style packages (spsc, spmc, mpsc, mpmc): broadcast's
+// Send never parks — it always returns immediately, overwriting on wrap —
+// so there is no parked-Send-races-Close window for shared use to expose.
+// Any number of goroutines may each hold their own *Receiver[T] (obtained
+// from [Hub.Receiver]) and call Recv/Close on it; the implementation does
 // not synchronize concurrent callers on the same receiver handle — call
 // [Hub.Receiver] once per subscriber. Every value goes to every live
 // receiver — this is fan-out, not load distribution. Use
@@ -261,10 +265,10 @@ func New[T any](capacity int) *Hub[T] {
 }
 
 // Sender returns the singleton send-side handle. Repeated calls return
-// the same handle. The handle is safe to share across goroutines —
-// Send, TrySend, SendContext, and Close may all be called concurrently
-// from any number of publishers. After the hub has been closed the
-// returned handle reports [gochan.ErrClosed] on use.
+// the same handle. The handle is safe to share across goroutines (see
+// the package doc for why broadcast is an exception to the "one handle,
+// one goroutine" rule). After the hub has been closed the returned
+// handle reports [gochan.ErrClosed] on use.
 func (h *Hub[T]) Sender() *Sender[T] { return h.tx }
 
 // Receiver returns a new subscriber bound to the ring. The receiver's

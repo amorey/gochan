@@ -119,7 +119,8 @@ type Hub[T any] struct {
 }
 
 // Sender is the singleton send-side handle. Safe to share across
-// goroutines.
+// goroutines (see the package doc for why watch is an exception to
+// the "one handle, one goroutine" rule).
 type Sender[T any] struct{ s *shared[T] }
 
 // Receiver is a receive-side handle. Each receiver tracks the version
@@ -157,10 +158,10 @@ func New[T any](initial T) *Hub[T] {
 }
 
 // Sender returns the singleton send-side handle. Repeated calls return
-// the same handle. The handle is safe to share across goroutines —
-// Send, TrySend, SendContext, and Close may all be called concurrently
-// from any number of publishers. After the hub has been closed the
-// returned handle reports [gochan.ErrClosed] on use.
+// the same handle. The handle is safe to share across goroutines (see
+// the package doc for why watch is an exception to the "one handle,
+// one goroutine" rule). After the hub has been closed the returned
+// handle reports [gochan.ErrClosed] on use.
 func (h *Hub[T]) Sender() *Sender[T] { return h.tx }
 
 // Receiver returns a new receiver bound to the hub. The receiver's

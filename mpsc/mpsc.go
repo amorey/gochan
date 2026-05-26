@@ -76,8 +76,8 @@ type shared[T any] struct {
 	chMu     sync.RWMutex
 	chClosed atomic.Bool
 
-	dead    *chancore.CloseOnce
-	txReady *chancore.CloseOnce // closed when the first Sender is registered
+	dead    chancore.CloseOnce
+	txReady chancore.CloseOnce // closed when the first Sender is registered
 
 	mu      sync.Mutex
 	txCount int // number of still-open senders
@@ -120,21 +120,20 @@ func New[T any](capacity int) *Hub[T] {
 	if capacity < 0 {
 		panic("mpsc: negative capacity")
 	}
-	s := &shared[T]{
-		ch:      make(chan T, capacity),
-		dead:    chancore.NewCloseOnce(),
-		txReady: chancore.NewCloseOnce(),
-	}
+	s := &shared[T]{ch: make(chan T, capacity)}
+	s.dead.Init()
+	s.txReady.Init()
 	s.send = chancore.BufferedSend[T]{
-		Ch:       s.ch,
-		Dead:     s.dead.Done(),
-		ChClosed: &s.chClosed,
-		SendLock: s.chMu.RLocker(),
+		Ch:        s.ch,
+		Dead:      s.dead.Done(),
+		ChClosed:  &s.chClosed,
+		SendLock:  s.chMu.RLocker(),
+		CloseLock: &s.chMu,
 	}
 	s.recv = chancore.BufferedRecv[T]{
 		Ch:    s.ch,
 		Dead:  s.dead.Done(),
-		Ready: s.txReady,
+		Ready: &s.txReady,
 	}
 	h := &Hub[T]{s: s}
 	h.rx = &Receiver[T]{s: s}
@@ -176,13 +175,10 @@ func (h *Hub[T]) Receiver() *Receiver[T] { return h.rx }
 // senders' close discipline — don't call concurrently with an active
 // Send on any sender from another goroutine.
 func (h *Hub[T]) Close() {
-	// Receiver.Close raises the dead signal — that's all live senders need
-	// to start returning ErrClosed, so we don't have to walk sender handles.
+	// Order matters: rx.Close raises dead so parked senders bail via the
+	// Dead arm and release chMu before CloseCh's writer Lock runs.
 	h.rx.Close()
-	// Then close ch directly so Chan consumers see channel-closed promptly.
-	// CloseCh's writer-side Lock waits for in-flight senders (holding
-	// RLock) to bail via the dead arm before close(ch) runs.
-	h.s.send.CloseCh(&h.s.chMu)
+	h.s.send.CloseCh()
 }
 
 // Send enqueues v, blocking while the buffer is full. Returns
@@ -233,7 +229,7 @@ func (tx *Sender[T]) Close() {
 	if !last {
 		return
 	}
-	s.send.CloseCh(&s.chMu)
+	s.send.CloseCh()
 }
 
 // Recv blocks until a value is available. Returns the next value in

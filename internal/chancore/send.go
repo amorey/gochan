@@ -19,12 +19,18 @@ import (
 // ChClosed is an atomic fast-path flag flipped to true by the close path
 // just before close(Ch). Senders check it before and after acquiring
 // SendLock so a closed channel is never written to.
+//
+// CloseLock is the writer-side lock that excludes in-flight senders when
+// [CloseCh] runs. For single-mutex packages (spmc) it is the same lock as
+// SendLock; for RWMutex setups (mpsc, mpmc) it is the write-side while
+// SendLock is the read-side.
 type BufferedSend[T any] struct {
-	Ch       chan<- T
-	Dead     <-chan struct{}
-	Ready    *CloseOnce // nil = no readiness gate
-	ChClosed *atomic.Bool
-	SendLock sync.Locker
+	Ch        chan<- T
+	Dead      <-chan struct{}
+	Ready     *CloseOnce // nil = no readiness gate
+	ChClosed  *atomic.Bool
+	SendLock  sync.Locker
+	CloseLock sync.Locker
 }
 
 // needReady reports whether the readiness arm still needs to be evaluated
@@ -33,12 +39,10 @@ func (s *BufferedSend[T]) needReady() bool {
 	return s.Ready != nil && !s.Ready.IsClosed()
 }
 
-// CloseCh marks Ch as closed and closes it. closeLock is the writer-side
-// lock that excludes in-flight senders (usually the same lock SendLock
-// wraps, or its write-side for RWMutex setups). Idempotent.
-func (s *BufferedSend[T]) CloseCh(closeLock sync.Locker) {
-	closeLock.Lock()
-	defer closeLock.Unlock()
+// CloseCh marks Ch as closed and closes it under CloseLock. Idempotent.
+func (s *BufferedSend[T]) CloseCh() {
+	s.CloseLock.Lock()
+	defer s.CloseLock.Unlock()
 	if s.ChClosed.CompareAndSwap(false, true) {
 		close(s.Ch)
 	}

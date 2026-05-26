@@ -221,7 +221,20 @@ On singleton-side architectures (e.g. spmc's `Sender`, mpsc's `Receiver`), repea
 
 Singleton-pair packages (`oneshot`, `spsc`) have no hub at all. Their constructors return `(*Sender[T], *Receiver[T], func())` directly — both handles plus a close-all function — giving a compile-time guarantee that the handles cannot be requested twice.
 
-The `Chan()` method on every receiver gives you a native `chan` for use in `select`. Closing a receiver does *not* close `Chan()` — use `Recv`/`TryRecv` if you need to observe receiver-close. Closing the sender (or calling the close-all) does close `Chan()` after the buffer drains, the same as `close()` on a raw Go channel.
+### Goroutine ownership
+
+**One handle, one goroutine.** Each `Sender` and `Receiver` represents a single participant in the dataflow and should be driven by a single goroutine. Concurrent `Send`/`Close` (or `Recv`/`Close`) on the same handle from different goroutines is not supported by `oneshot`, `spsc`, `spmc`, `mpsc`, or `mpmc` — the implementations do not synchronize callers on the same handle, and mixing produces races and undefined Close ordering. If you want N producers or N consumers, mint N handles from the hub (`Hub.Sender()` / `Hub.Receiver()` return fresh handles on multi-side packages).
+
+The two exceptions are `broadcast` and `watch`: their `Sender` is explicitly safe to share across goroutines because `Send` never parks — it overwrites instead. Without a parked Send, there is no race window between `Send` and `Close` to worry about, so the shared-handle promise costs nothing. If you need to publish from many goroutines into a broadcast or watch hub, you can share the singleton `Sender` directly.
+
+
+
+The `Chan()` method on every receiver gives you a native `chan` for use in `select`. Two flavors depending on the package:
+
+- **Queue-style shared channels** (`spsc`, `spmc`, `mpsc`, `mpmc`): `Chan()` exposes the underlying buffered channel that the sender writes into. Closing the receiver does *not* close `Chan()` — use `Recv`/`TryRecv` if you need to observe receiver-close. The channel closes only when the sender closes (directly or via close-all) and the buffer drains, the same as `close()` on a raw Go channel.
+- **Per-receiver feeder channels** (`broadcast`, `watch`): `Chan()` returns a private channel fed by a per-receiver goroutine. Closing the receiver *does* close `Chan()` (the feeder shuts down), and so does sender-close after the feeder drains its last value. Always `Close` the receiver when you stop reading, or the feeder goroutine pins itself waiting for the next value.
+
+For `oneshot`, `Chan()` exposes the one-slot delivery channel; sender-close closes it after the (at most one) value is observed.
 
 ### Close semantics
 

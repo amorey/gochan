@@ -13,6 +13,48 @@
 // the receiver. [Hub.Close] is equivalent to calling Close on the
 // receiver and on every live sender — don't call it concurrently with an
 // active Send on any sender from another goroutine.
+//
+// # Typical uses
+//
+// Fan-in of events from many worker goroutines into a single aggregator,
+// collecting results from a scatter of parallel tasks, funnelling
+// log/metric/event streams to one writer.
+//
+// # Semantics
+//
+// Multi producer / single consumer. Any number of goroutines may each
+// hold their own *Sender[T] (obtained from [Hub.Sender]) and call
+// Send/Close on it. Exactly one goroutine should call Recv/Close on the
+// receiver. The implementation does not synchronize concurrent callers
+// on the same sender handle — call [Hub.Sender] once per producer
+// goroutine.
+//
+// FIFO across the queue, not across producers. The queue itself preserves
+// the order in which sends arrive at the underlying channel, but the
+// relative ordering of sends from different producers is not defined — it
+// depends on scheduling. Sends from a single producer remain in order
+// with respect to each other.
+//
+// All senders closed ⇒ receiver drains, then sees ErrClosed. Once at
+// least one sender has been registered, the receiver observes
+// [gochan.ErrClosed] when both (a) every sender obtained from
+// [Hub.Sender] has been closed and (b) the buffer is empty. A freshly
+// constructed hub with zero senders ever registered is not treated as
+// closed — Recv blocks waiting for the first producer. If you spawn N
+// producers you must close all N — a forgotten Close on any one of them
+// leaves the receiver waiting forever for an EOF that never arrives.
+//
+// Receiver close stops everything. Closing the receiver immediately fails
+// every pending and future Send across all senders with
+// [gochan.ErrClosed] and abandons any buffered values.
+//
+// Backpressure. A bounded buffer applies natural backpressure: when full,
+// Send blocks until the consumer makes room. Use capacity == 0 for strict
+// rendezvous handoff with no buffering.
+//
+// Hub close-all. [Hub.Close] calls Close on every live sender and on the
+// receiver. Recv-style callers see [gochan.ErrClosed] immediately; Chan
+// consumers drain remaining values before seeing channel-closed.
 package mpsc
 
 import (
@@ -201,6 +243,7 @@ func (tx *Sender[T]) Close() {
 func (rx *Receiver[T]) Recv() (T, error) { return rx.s.recv.Recv() }
 
 // TryRecv is non-blocking. Returns the next value if one is buffered,
+// [gochan.ErrNotReady] if no sender has yet been registered,
 // [gochan.ErrEmpty] if the buffer is empty but at least one sender is
 // still open, or [gochan.ErrClosed] if the buffer is empty and all
 // senders are closed (or this receiver/the hub is closed).

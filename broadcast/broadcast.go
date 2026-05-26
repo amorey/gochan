@@ -19,6 +19,119 @@
 // any [Hub.Receiver] call are written into the ring but never delivered.
 // Late subscribers start at the sender's current write position — they
 // do not see historical values.
+//
+// # Typical uses
+//
+// Event-stream fan-out (one producer, many listeners), configuration-
+// change notifications, market-data ticks distributed to many strategies,
+// WebSocket / SSE push systems where slow clients must not back up the
+// publisher.
+//
+// Unlike spmc/mpmc, every receiver sees every value (unless there's lag).
+// Unlike [github.com/amorey/gochan/watch], values are buffered (you see
+// the last N, not just the most recent).
+//
+// # Semantics
+//
+// Shared singleton sender, fan-out delivery. The send-side handle
+// returned by [Hub.Sender] is a singleton that is safe to share across
+// goroutines: any number of publishers may call Send / TrySend /
+// SendContext / Close concurrently on the same handle. Any number of
+// goroutines may each hold their own *Receiver[T] (obtained from
+// [Hub.Receiver]) and call Recv/Close on it; the implementation does
+// not synchronize concurrent callers on the same receiver handle — call
+// [Hub.Receiver] once per subscriber. Every value goes to every live
+// receiver — this is fan-out, not load distribution. Use
+// [github.com/amorey/gochan/spmc] or [github.com/amorey/gochan/mpmc] if
+// you want each value delivered to exactly one consumer.
+//
+// Drop-oldest, with sender-observable pressure. The ring buffer holds
+// at most capacity values. When Send wraps around onto a slot still
+// holding an unread value, the unread value is overwritten and the
+// affected receiver(s) see [gochan.ErrLagged] on their next Recv.
+// TrySend exposes the same condition to the publisher: it returns
+// [gochan.ErrFull] and refuses to write when an overwrite would occur,
+// letting publishers self-throttle or drop-newest if they prefer.
+//
+// Late subscribers see only future values. A receiver obtained via
+// [Hub.Receiver] starts at the sender's current write position. Values
+// published before registration are not replayed. To make a value
+// durable across a subscribe boundary, publish it again after
+// subscription completes.
+//
+// Sender Send never blocks. By design, Send always returns immediately
+// (success, overwrite, or [gochan.ErrClosed]). This is the inverse of
+// the queue-style packages, where Send blocks under backpressure. If
+// you want backpressure here, use TrySend + a back-off loop, or use
+// [github.com/amorey/gochan/mpmc] instead.
+//
+// No empty-hub gating. Unlike spmc / mpmc, broadcast does not block Send
+// on the first [Hub.Receiver] call. Values published with no subscribers
+// are written to the ring but never delivered — subsequent subscribers
+// start at "now" and don't see them. This package therefore never
+// returns [gochan.ErrNotReady].
+//
+// Hub close-all. [Hub.Close] closes the sender and every live receiver.
+// Recv-style callers can drain anything they had not yet consumed at
+// the time of close (subject to lag) before seeing [gochan.ErrClosed];
+// Chan consumers see the channel close after their drain. The sender's
+// view of close is immediate.
+//
+// # Patterns
+//
+// Fire-and-forget telemetry — publisher doesn't care about lag,
+// subscribers handle it:
+//
+//	hub := broadcast.New[Metric](1024)
+//
+//	tx := hub.Sender()
+//	go func() {
+//	    for m := range metricStream {
+//	        tx.Send(m) // never blocks; overwrites on wrap
+//	    }
+//	    tx.Close()
+//	}()
+//
+//	rx := hub.Receiver().(*broadcast.Receiver[Metric])
+//	for {
+//	    m, err := rx.Recv()
+//	    var lagged gochan.ErrLagged
+//	    switch {
+//	    case errors.As(err, &lagged):
+//	        log.Warn("dropped metrics", "missed", lagged.Missed)
+//	        continue
+//	    case errors.Is(err, gochan.ErrClosed):
+//	        return
+//	    }
+//	    process(m)
+//	}
+//
+// Sender-side observability — publisher tracks subscriber lag without
+// changing delivery:
+//
+//	for state := range stateStream {
+//	    if err := tx.TrySend(state); errors.Is(err, gochan.ErrFull) {
+//	        metrics.Inc("broadcast.subscriber_lagging")
+//	    }
+//	    tx.Send(state) // commit anyway — drop-oldest is fine for this stream
+//	}
+//
+// User-built drop-newest — preserve older values when the ring is full:
+//
+//	for evt := range events {
+//	    if err := tx.TrySend(evt); errors.Is(err, gochan.ErrFull) {
+//	        droppedCount.Add(1)
+//	        continue // skip the new value; keep older ones in the ring
+//	    }
+//	}
+//
+// Self-throttling publisher — slow down when subscribers lag:
+//
+//	for v := range source {
+//	    for tx.TrySend(v) != nil {
+//	        time.Sleep(backoff)
+//	    }
+//	}
 package broadcast
 
 import (
@@ -146,6 +259,11 @@ func New[T any](capacity int) *Hub[T] {
 	return &Hub[T]{s: s, tx: &Sender[T]{s: s}}
 }
 
+// Sender returns the singleton send-side handle. Repeated calls return
+// the same handle. The handle is safe to share across goroutines —
+// Send, TrySend, SendContext, and Close may all be called concurrently
+// from any number of publishers. After the hub has been closed the
+// returned handle reports [gochan.ErrClosed] on use.
 func (h *Hub[T]) Sender() gochan.Sender[T] { return h.tx }
 
 // Receiver returns a new subscriber bound to the ring. The receiver's
@@ -196,6 +314,11 @@ func (h *Hub[T]) Close() {
 	s.minStale = false
 }
 
+// Send publishes v to the ring and returns immediately. Send never
+// blocks: if the ring is full of unread values, the oldest unread slot
+// is overwritten and the receiver(s) holding that slot will see
+// [gochan.ErrLagged] on their next Recv. Returns [gochan.ErrClosed] if
+// the sender or hub has been closed; on ErrClosed the value is dropped.
 func (tx *Sender[T]) Send(v T) error {
 	s := tx.s
 	s.mu.Lock()
@@ -210,8 +333,15 @@ func (tx *Sender[T]) Send(v T) error {
 	return nil
 }
 
-// TrySend returns [gochan.ErrFull] — without writing — if publishing
-// v would evict an unread value from at least one live receiver.
+// TrySend is the pressure-aware variant of [Sender.Send]. Returns
+// [gochan.ErrFull] — without writing — if publishing v would evict an
+// unread value from at least one live receiver. Returns
+// [gochan.ErrClosed] if closed. Returns nil on a successful write.
+//
+// TrySend is the entry point for senders that want to observe
+// subscriber lag (for metrics, back-pressure, or self-throttling) or
+// implement a drop-newest policy on top of the package's default
+// drop-oldest behavior — see the package overview for patterns.
 func (tx *Sender[T]) TrySend(v T) error {
 	s := tx.s
 	s.mu.Lock()
@@ -244,6 +374,10 @@ func (tx *Sender[T]) SendContext(ctx context.Context, v T) error {
 	return tx.Send(v)
 }
 
+// Close closes the sender. Already-published values remain in the ring
+// and remain receivable (subject to lag) until each receiver catches
+// up. Further Send / TrySend / SendContext calls return
+// [gochan.ErrClosed]. Idempotent.
 func (tx *Sender[T]) Close() {
 	s := tx.s
 	s.mu.Lock()
@@ -255,8 +389,25 @@ func (tx *Sender[T]) Close() {
 	s.signalLocked()
 }
 
+// Recv blocks until the next value is available at this receiver's
+// position, the sender has closed and this receiver has caught up, or
+// this receiver / the hub is closed. Returns the next value, or one
+// of:
+//
+//   - [gochan.ErrLagged] — the receiver fell more than capacity values
+//     behind the sender; some values were overwritten. The error
+//     carries Missed — the number of values dropped before the receiver
+//     caught up. The receiver's position is reset to the oldest
+//     still-buffered value; the next Recv resumes from there. The
+//     receiver is still usable.
+//   - [gochan.ErrClosed] — the sender or hub has closed and this
+//     receiver has already drained everything still in the ring at or
+//     after its position.
 func (rx *Receiver[T]) Recv() (T, error) { return rx.recvLoop(nil) }
 
+// RecvContext blocks like [Receiver.Recv] but returns ctx.Err() if ctx
+// is cancelled first. A ready value or [gochan.ErrLagged] is preferred
+// over a cancelled context.
 func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
 	return rx.recvLoop(ctx)
 }

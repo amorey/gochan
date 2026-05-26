@@ -12,6 +12,56 @@
 // [Hub.Receiver] is safe to call from any goroutine, but each *Receiver[T]
 // is intended for use by a single consumer goroutine. [Hub.Close] calls
 // Close on the sender and on every live receiver.
+//
+// Unlike [github.com/amorey/gochan/broadcast], every value goes to one
+// receiver, not all of them — spmc is load distribution, not fan-out.
+//
+// # Typical uses
+//
+// Distributing work items to a pool of workers from a single dispatcher
+// goroutine, parallelizing a CPU-bound pipeline stage, fanning a single
+// input stream out across N consumers without duplication.
+//
+// # Semantics
+//
+// Shared singleton sender, multi consumer. The send-side handle returned
+// by [Hub.Sender] is a singleton that is safe to share across goroutines:
+// any number of goroutines may call Send / TrySend / SendContext / Close
+// concurrently on the same handle. Any number of goroutines may each hold
+// their own *Receiver[T] (obtained from [Hub.Receiver]) and call
+// Recv/Close on it; the implementation does not synchronize concurrent
+// callers on the same receiver handle — call [Hub.Receiver] once per
+// worker.
+//
+// Each value to exactly one receiver. Values are not broadcast. A Send
+// deposits one value into the shared queue, and the next Recv on any
+// receiver removes it. Choice of receiver is non-deterministic and not
+// guaranteed to be fair — it follows Go's channel-receive scheduling.
+//
+// FIFO ordering across the queue. The queue itself preserves send order,
+// but because work is split across multiple consumers, any single receiver
+// only sees a subsequence of the sends — interleaved with the work other
+// receivers grabbed.
+//
+// Sender close drains. Closing the sender does not discard already-buffered
+// values; receivers drain them in order before any of them observes
+// [gochan.ErrClosed]. Closing a single receiver, by contrast, only affects
+// that receiver; the queue keeps flowing through the remaining ones.
+//
+// All receivers closed ⇒ sender sees ErrClosed. If every receiver has been
+// closed, the sender's next Send/TrySend/SendContext returns
+// [gochan.ErrClosed] and the value is dropped. This is how a sender
+// notices that there is nobody left to receive its work.
+//
+// Backpressure. A bounded buffer applies natural backpressure: when full,
+// Send blocks until some receiver makes room. Use capacity == 0 for strict
+// rendezvous handoff with no buffering — useful when you want producers to
+// slow down to exactly the rate of the slowest combined consumer
+// throughput.
+//
+// Hub close-all. [Hub.Close] calls Close on every live receiver and on the
+// sender. Recv-style callers see [gochan.ErrClosed] immediately; Chan
+// consumers drain remaining values before seeing channel-closed.
 package spmc
 
 import (
@@ -138,9 +188,10 @@ func (h *Hub[T]) Close() {
 // closed, every receiver has been closed, or the hub has been closed.
 func (tx *Sender[T]) Send(v T) error { return tx.s.send.Send(v) }
 
-// TrySend is non-blocking. Returns [gochan.ErrFull] if the buffer is full
-// and no receiver is currently parked on a recv, [gochan.ErrClosed] if
-// closed, or nil on success.
+// TrySend is non-blocking. Returns [gochan.ErrNotReady] if no receiver
+// has yet been registered, [gochan.ErrFull] if the buffer is full and no
+// receiver is currently parked on a recv, [gochan.ErrClosed] if closed,
+// or nil on success.
 func (tx *Sender[T]) TrySend(v T) error { return tx.s.send.TrySend(v) }
 
 // SendContext blocks like Send but returns ctx.Err() if ctx is cancelled

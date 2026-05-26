@@ -22,6 +22,62 @@
 // subsequent calls return [gochan.ErrClosed]. Closing a receiver,
 // by contrast, fails further Recv calls on that handle immediately —
 // any unseen pending value is abandoned.
+//
+// # Typical uses
+//
+// Configuration / settings propagation, "current state" distribution
+// (current leader, current connection status, current feature flags),
+// shutdown / cancellation signals carrying a final state, low-frequency
+// control-plane updates where consumers only care about the latest
+// snapshot.
+//
+// Unlike [github.com/amorey/gochan/broadcast], only the latest value is
+// retained — receivers that fall behind catch up to "now" rather than
+// seeing each intermediate value. Unlike spmc/mpmc, every receiver sees
+// its own copy of the value (it is not load-distributed).
+//
+// # Semantics
+//
+// Latest-value-only delivery. Watch maintains a single slot containing
+// the "current" value. Each Send overwrites that slot. Receivers see
+// the slot's contents, not a stream — if the sender publishes A, B, C
+// in rapid succession and the receiver only calls Recv once afterwards,
+// the receiver sees C (A and B are silently dropped). This is the
+// intended behavior; use [github.com/amorey/gochan/broadcast] if you
+// need every value.
+//
+// Initial value is part of the API. Every receiver's first Recv returns
+// the current value without waiting — there is no "empty" state. This
+// makes watch ideal for "current configuration / current state"
+// patterns where new subscribers need to bootstrap immediately rather
+// than waiting for the next change.
+//
+// Late subscribers see the current value. Unlike broadcast, which gives
+// late subscribers only future values, a watch receiver registered at
+// time T sees whatever value is current at time T as its first Recv
+// result. There is no concept of "missed values" — only "the latest
+// value, when you ask for it."
+//
+// Sender Send never blocks. By design, Send always returns immediately
+// (success or [gochan.ErrClosed]). Slow receivers cannot apply
+// backpressure to the publisher — they just skip ahead to the newest
+// value when they next read.
+//
+// Sender close delivers the final value. Closing the sender does not
+// immediately fail in-flight or future Recv calls on receivers that
+// have not yet observed the final value: each receiver gets one more
+// Recv returning the current value (if it had not already caught up)
+// before subsequent calls return [gochan.ErrClosed]. This is the
+// standard "final state" pattern — shutdown signals carrying a final
+// reason, last-known-good config on close, etc.
+//
+// Hub close-all. [Hub.Close] closes the sender and locks out future
+// [Hub.Receiver] calls. Live receivers observe sender-close through the
+// normal drain path: those that had not yet observed the latest value
+// may still receive it once via Recv / Chan; receivers already caught
+// up see [gochan.ErrClosed] immediately. A receiver obtained from a
+// hub that has already been closed delivers the final value once
+// before ErrClosed.
 package watch
 
 import (
@@ -100,6 +156,11 @@ func New[T any](initial T) *Hub[T] {
 	return &Hub[T]{s: s, tx: &Sender[T]{s: s}}
 }
 
+// Sender returns the singleton send-side handle. Repeated calls return
+// the same handle. The handle is safe to share across goroutines —
+// Send, TrySend, SendContext, and Close may all be called concurrently
+// from any number of publishers. After the hub has been closed the
+// returned handle reports [gochan.ErrClosed] on use.
 func (h *Hub[T]) Sender() gochan.Sender[T] { return h.tx }
 
 // Receiver returns a new receiver bound to the hub. The receiver's

@@ -3,10 +3,10 @@
 // A [Hub] hands out any number of [Sender] handles and any number of
 // [Receiver] handles. Senders feed values into a bounded buffer drained
 // by the receivers, with each value delivered to exactly one receiver
-// (load distribution, not fan-out — for fan-out use the broadcast
-// package). Capacity behaves exactly like a Go buffered channel:
-// New[T](0) is a rendezvous channel, New[T](n) allows n queued values
-// before Send blocks.
+// (load distribution, not fan-out — for fan-out use the
+// [github.com/amorey/gochan/broadcast] package). Capacity behaves
+// exactly like a Go buffered channel: New[T](0) is a rendezvous channel,
+// New[T](n) allows n queued values before Send blocks.
 //
 // Any number of goroutines may each hold their own *Sender[T] and call
 // Send/Close on it; the implementation does not synchronize concurrent
@@ -16,6 +16,61 @@
 // equivalent to calling Close on every live sender and receiver — don't
 // call it concurrently with an active Send on any sender from another
 // goroutine.
+//
+// # Typical uses
+//
+// Work queues with both elastic producer and consumer pools, ingestion
+// pipelines where N publishers feed M workers, generic job/task queues
+// without a designated dispatcher.
+//
+// # Semantics
+//
+// Multi producer / multi consumer. Any number of goroutines may each hold
+// their own *Sender[T] (obtained from [Hub.Sender]) and call Send/Close
+// on it; any number may each hold their own *Receiver[T] (obtained from
+// [Hub.Receiver]) and call Recv/Close on it. The implementation does not
+// synchronize concurrent callers on the same sender or receiver handle —
+// call [Hub.Sender] once per producer goroutine and [Hub.Receiver] once
+// per worker.
+//
+// Each value to exactly one receiver. Values are not broadcast. A Send
+// deposits one value into the shared queue, and the next Recv on any
+// receiver removes it. Choice of receiver is non-deterministic and not
+// guaranteed to be fair — it follows Go's channel-receive scheduling.
+//
+// FIFO across the queue, not across producers or consumers. The queue
+// itself preserves the order in which sends arrive at the underlying
+// channel. Sends from a single producer remain in order with respect to
+// each other, but the relative ordering of sends from different producers
+// depends on scheduling. Any single receiver only sees a subsequence of
+// the sends — interleaved with the work other receivers grabbed.
+//
+// Empty-hub gating. A freshly constructed hub has neither senders nor
+// receivers registered. Send blocks until [Hub.Receiver] has been called
+// at least once; Recv blocks until [Hub.Sender] has been called at least
+// once and a value has been sent. The implicit-close rules below only
+// apply after each side has had at least one registration.
+//
+// All senders closed ⇒ receivers drain, then see ErrClosed. Once at
+// least one sender has been registered, every receiver observes
+// [gochan.ErrClosed] when both (a) every sender obtained from
+// [Hub.Sender] has been closed and (b) the buffer is empty. If you spawn
+// N producers you must close all N — a forgotten Close on any one of
+// them leaves receivers waiting forever for an EOF that never arrives.
+//
+// All receivers closed ⇒ senders see ErrClosed. Once at least one
+// receiver has been registered, every sender's next
+// Send/TrySend/SendContext returns [gochan.ErrClosed] if every receiver
+// has been closed, and any buffered values are abandoned for Recv-style
+// callers. This is how senders notice that nobody is left to do the work.
+//
+// Backpressure. A bounded buffer applies natural backpressure: when full,
+// Send blocks until some receiver makes room. Use capacity == 0 for
+// strict rendezvous handoff with no buffering.
+//
+// Hub close-all. [Hub.Close] calls Close on every live sender and every
+// live receiver. Recv-style callers see [gochan.ErrClosed] immediately;
+// Chan consumers drain remaining values before seeing channel-closed.
 package mpmc
 
 import (

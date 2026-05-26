@@ -4,6 +4,31 @@
 // one Recv. [New] hands out a sender, a receiver, and a close function
 // that calls Close on both. Either side may cancel by closing its handle,
 // and the other side observes [gochan.ErrClosed] on its next operation.
+//
+// # Typical uses
+//
+// Returning a single result from a goroutine, request/response RPC-style
+// handoff, "done" signalling with an attached value.
+//
+// # Semantics
+//
+// Single delivery. After one successful Send/Recv pair, both sides are
+// spent. Subsequent Send returns [gochan.ErrClosed]; subsequent Recv
+// returns [gochan.ErrClosed].
+//
+// Cancellation. Either side may Close to abandon the exchange. The other
+// side observes [gochan.ErrClosed] on its next operation. If Send and
+// receiver-Close race, exactly one wins: either the value is delivered, or
+// the value is dropped and Send returns [gochan.ErrClosed].
+//
+// No goroutine leak. Because Send does not block on a receiver, a sender
+// that completes its work and then has its receiver vanish never leaks.
+// Conversely, a Recv caller that wants to bail must use [Receiver.RecvContext]
+// or [Receiver.Close].
+//
+// Close-all. The close function returned by [New] calls Close on both
+// handles. The pending value (if any) is dropped, and both Send and Recv
+// return [gochan.ErrClosed]. Convenient as a defer.
 package oneshot
 
 import (
@@ -146,7 +171,12 @@ func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
 }
 
 // Chan returns a native channel that yields the value once and is then
-// closed. Repeated calls return the same channel.
+// closed, or closes empty if the pair is cancelled before a successful
+// Send. Useful in a select. Repeated calls return the same channel.
+//
+// If Chan is used, the value is delivered there and a subsequent Recv on
+// the same receiver returns [gochan.ErrClosed] — pick one consumption
+// mechanism per receiver.
 func (rx *Receiver[T]) Chan() <-chan T {
 	s := rx.s
 	s.mu.Lock()

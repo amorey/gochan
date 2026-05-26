@@ -264,12 +264,12 @@ func New[T any](capacity int) *Hub[T] {
 // Send, TrySend, SendContext, and Close may all be called concurrently
 // from any number of publishers. After the hub has been closed the
 // returned handle reports [gochan.ErrClosed] on use.
-func (h *Hub[T]) Sender() gochan.Sender[T] { return h.tx }
+func (h *Hub[T]) Sender() *Sender[T] { return h.tx }
 
 // Receiver returns a new subscriber bound to the ring. The receiver's
 // read position is set to the sender's current write position — only
 // values published after this call are delivered.
-func (h *Hub[T]) Receiver() gochan.Receiver[T] {
+func (h *Hub[T]) Receiver() *Receiver[T] {
 	s := h.s
 	s.mu.Lock()
 	defer s.mu.Unlock()

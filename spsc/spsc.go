@@ -64,7 +64,7 @@ func New[T any](capacity int) (*Sender[T], *Receiver[T], func()) {
 		panic("spsc: negative capacity")
 	}
 	h := mpsc.New[T](capacity)
-	tx := h.Sender().(*mpsc.Sender[T])
-	rx := h.Receiver().(*mpsc.Receiver[T])
+	tx := h.Sender()
+	rx := h.Receiver()
 	return &Sender[T]{tx}, &Receiver[T]{rx}, h.Close
 }

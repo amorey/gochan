@@ -13,8 +13,10 @@ semantics tables, error meanings). When changing public behavior, update
 
 ## Layout
 
-- `gochan.go` — common `Sender[T]`, `Receiver[T]`, and `Hub[T]` interfaces
-  every package's handles implement.
+- `gochan.go` — common `Sender[T]` and `Receiver[T]` interfaces every
+  package's handles implement. There is intentionally no shared `Hub`
+  interface — each multi-side package exposes its own concrete `*Hub[T]`
+  so callers can't accidentally substitute one architecture for another.
 - `errors.go` — shared sentinel errors: `ErrClosed`, `ErrFull`, `ErrEmpty`,
   `ErrNotReady`, and `ErrLagged` (broadcast only).
 - `oneshot/`, `spsc/` — singleton-pair packages. Constructors return

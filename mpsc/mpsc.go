@@ -149,7 +149,7 @@ func New[T any](capacity int) *Hub[T] {
 // previously-registered sender has already closed) or the receiver has
 // been closed, the returned handle is pre-closed and reports
 // [gochan.ErrClosed] on use.
-func (h *Hub[T]) Sender() gochan.Sender[T] {
+func (h *Hub[T]) Sender() *Sender[T] {
 	s := h.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -166,7 +166,7 @@ func (h *Hub[T]) Sender() gochan.Sender[T] {
 // [Hub.Close], or implicitly because every previously-registered sender
 // has already closed) the returned handle reports [gochan.ErrClosed] on
 // use.
-func (h *Hub[T]) Receiver() gochan.Receiver[T] { return h.rx }
+func (h *Hub[T]) Receiver() *Receiver[T] { return h.rx }
 
 // Close closes the hub by calling Close on every live sender and on the
 // receiver. The receiver is closed first (so an in-flight Send escapes

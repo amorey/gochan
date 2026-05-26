@@ -208,19 +208,18 @@ type Receiver[T any] interface {
 }
 ```
 
-Multi-side packages (`spmc`, `mpsc`, `mpmc`, `broadcast`, `watch`) additionally implement `gochan.Hub[T]`:
+Multi-side packages (`spmc`, `mpsc`, `mpmc`, `broadcast`, `watch`) each expose their own concrete `*Hub[T]` type. There is intentionally no shared `Hub` interface: the semantics differ enough between packages (e.g. `mpmc` drops nothing while `broadcast` returns `ErrLagged`) that being able to swap one for another behind a single interface would be a footgun. Every hub has the same three-method shape:
 
 ```go
-type Hub[T any] interface {
-    Sender()   Sender[T]                         // returns a fresh handle (multi-side) or the singleton (single-side)
-    Receiver() Receiver[T]                       // same
-    Close()                                      // closes every live handle; idempotent
-}
+// On each package's *Hub[T]:
+Sender()   *Sender[T]    // fresh handle on multi-Sender packages; the singleton on single-Sender packages
+Receiver() *Receiver[T]  // same shape for the receive side
+Close()                  // closes every live handle; idempotent
 ```
 
 On singleton-side architectures (e.g. spmc's `Sender`, mpsc's `Receiver`), repeated calls return the same handle — `Sender()` and `Receiver()` are idempotent getters there. On multi-side architectures they hand out a fresh handle each call. After the hub has been closed, the returned handle reports `ErrClosed` on use; you don't have to check up-front.
 
-Singleton-pair packages (`oneshot`, `spsc`) do not implement `gochan.Hub`. Their constructors return `(*Sender[T], *Receiver[T], func())` directly — both handles plus a close-all function — giving a compile-time guarantee that the handles cannot be requested twice.
+Singleton-pair packages (`oneshot`, `spsc`) have no hub at all. Their constructors return `(*Sender[T], *Receiver[T], func())` directly — both handles plus a close-all function — giving a compile-time guarantee that the handles cannot be requested twice.
 
 The `Chan()` method on every receiver gives you a native `chan` for use in `select`. Closing a receiver does *not* close `Chan()` — use `Recv`/`TryRecv` if you need to observe receiver-close. Closing the sender (or calling the close-all) does close `Chan()` after the buffer drains, the same as `close()` on a raw Go channel.
 

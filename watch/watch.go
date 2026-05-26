@@ -161,7 +161,7 @@ func New[T any](initial T) *Hub[T] {
 // Send, TrySend, SendContext, and Close may all be called concurrently
 // from any number of publishers. After the hub has been closed the
 // returned handle reports [gochan.ErrClosed] on use.
-func (h *Hub[T]) Sender() gochan.Sender[T] { return h.tx }
+func (h *Hub[T]) Sender() *Sender[T] { return h.tx }
 
 // Receiver returns a new receiver bound to the hub. The receiver's
 // first Recv returns the hub's current value immediately; subsequent
@@ -169,7 +169,7 @@ func (h *Hub[T]) Sender() gochan.Sender[T] { return h.tx }
 // already been closed the receiver still delivers the final value
 // once (its lastSeen=0 < version) before subsequent calls return
 // [gochan.ErrClosed].
-func (h *Hub[T]) Receiver() gochan.Receiver[T] {
+func (h *Hub[T]) Receiver() *Receiver[T] {
 	rx := &Receiver[T]{s: h.s}
 	rx.done.Init()
 	return rx

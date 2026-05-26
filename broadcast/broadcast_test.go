@@ -22,19 +22,18 @@ func newHub[T any](t *testing.T, capacity int) *broadcast.Hub[T] {
 
 func newTx[T any](t *testing.T, h *broadcast.Hub[T]) *broadcast.Sender[T] {
 	t.Helper()
-	return h.Sender().(*broadcast.Sender[T])
+	return h.Sender()
 }
 
 func newRx[T any](t *testing.T, h *broadcast.Hub[T]) *broadcast.Receiver[T] {
 	t.Helper()
-	return h.Receiver().(*broadcast.Receiver[T])
+	return h.Receiver()
 }
 
 func TestImplementsCommonInterfaces(t *testing.T) {
 	h := newHub[int](t, 4)
 	tx := newTx(t, h)
 	rx := newRx(t, h)
-	var _ gochan.Hub[int] = h
 	var _ gochan.Sender[int] = tx
 	var _ gochan.Receiver[int] = rx
 }

@@ -18,18 +18,17 @@ import (
 func newHubRx[T any](t *testing.T, capacity int) (*mpsc.Hub[T], *mpsc.Receiver[T]) {
 	t.Helper()
 	h := mpsc.New[T](capacity)
-	return h, h.Receiver().(*mpsc.Receiver[T])
+	return h, h.Receiver()
 }
 
 func newTx[T any](t *testing.T, h *mpsc.Hub[T]) *mpsc.Sender[T] {
 	t.Helper()
-	return h.Sender().(*mpsc.Sender[T])
+	return h.Sender()
 }
 
 func TestImplementsCommonInterfaces(t *testing.T) {
 	h, rx := newHubRx[int](t, 1)
 	tx := newTx(t, h)
-	var _ gochan.Hub[int] = h
 	var _ gochan.Sender[int] = tx
 	var _ gochan.Receiver[int] = rx
 }

@@ -146,7 +146,7 @@ func New[T any](capacity int) *Hub[T] {
 // the same handle. If the hub has been closed (explicitly or because
 // every previously-registered receiver has already closed) the returned
 // handle reports [gochan.ErrClosed] on use.
-func (h *Hub[T]) Sender() gochan.Sender[T] { return h.tx }
+func (h *Hub[T]) Sender() *Sender[T] { return h.tx }
 
 // Receiver returns a new receive-side handle bound to the shared queue.
 // Use this to add workers to the consumer pool. Each returned receiver
@@ -155,7 +155,7 @@ func (h *Hub[T]) Sender() gochan.Sender[T] { return h.tx }
 // (explicitly or because every previously-registered receiver has already
 // closed) the returned handle is pre-closed and reports [gochan.ErrClosed]
 // on use.
-func (h *Hub[T]) Receiver() gochan.Receiver[T] {
+func (h *Hub[T]) Receiver() *Receiver[T] {
 	s := h.s
 	s.mu.Lock()
 	defer s.mu.Unlock()

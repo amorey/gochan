@@ -22,19 +22,18 @@ func newHub[T any](t *testing.T, initial T) *watch.Hub[T] {
 
 func newTx[T any](t *testing.T, h *watch.Hub[T]) *watch.Sender[T] {
 	t.Helper()
-	return h.Sender().(*watch.Sender[T])
+	return h.Sender()
 }
 
 func newRx[T any](t *testing.T, h *watch.Hub[T]) *watch.Receiver[T] {
 	t.Helper()
-	return h.Receiver().(*watch.Receiver[T])
+	return h.Receiver()
 }
 
 func TestImplementsCommonInterfaces(t *testing.T) {
 	h := newHub[int](t, 0)
 	tx := newTx(t, h)
 	rx := newRx(t, h)
-	var _ gochan.Hub[int] = h
 	var _ gochan.Sender[int] = tx
 	var _ gochan.Receiver[int] = rx
 }

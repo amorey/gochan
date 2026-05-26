@@ -51,20 +51,26 @@ func New[T any]() (*Sender[T], *Receiver[T], func()) {
 func (tx *Sender[T]) Send(v T) error {
 	s := tx.s
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.terminalLocked() {
+		s.mu.Unlock()
 		return gochan.ErrClosed
 	}
-	s.val = v
-	s.hasVal = true
-	if s.userCh != nil {
-		// Chan() was registered earlier; deliver inline (cap-1, never pushed).
-		s.userCh <- v
-		close(s.userCh)
-		var z T
-		s.val = z
-		s.hasVal = false
+	userCh := s.userCh
+	if userCh != nil {
+		// Chan() was registered earlier; the receiver is parked on userCh,
+		// not on the slot. Mark consumed under the lock so concurrent
+		// Recv/TryRecv/Close see the terminal state, then deliver outside
+		// the critical section. The cap-1 userCh has never been written to,
+		// so the send below never blocks.
 		s.rxClosed = true
+	} else {
+		s.val = v
+		s.hasVal = true
+	}
+	s.mu.Unlock()
+	if userCh != nil {
+		userCh <- v
+		close(userCh)
 	}
 	close(s.done)
 	return nil
@@ -191,15 +197,14 @@ func (rx *Receiver[T]) Close() {
 // consume returns the slot value or ErrClosed if unavailable. Caller must
 // have observed s.done closed (or be the only path that knows it's safe).
 func (rx *Receiver[T]) consume() (T, error) {
+	var z T
 	s := rx.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.hasVal || s.rxClosed {
-		var z T
 		return z, gochan.ErrClosed
 	}
 	v := s.val
-	var z T
 	s.val = z
 	s.hasVal = false
 	s.rxClosed = true

@@ -535,7 +535,7 @@ func NewUnbounded[T any]()           *Hub[T]
   <dd>Creates a fresh mpsc hub with an unbounded internal queue. <code>Send</code> never blocks on capacity (only on closed state). Use this when bursts are unavoidable and bounded backpressure would deadlock you — but watch for memory growth if producers can outrun the consumer indefinitely. <code>TrySend</code> never returns <code>ErrFull</code>.</dd>
 </dl>
 
-A freshly constructed mpsc hub has no senders, so <code>Recv</code> will block (or <code>TryRecv</code> will report <code>ErrEmpty</code>) until at least one producer is registered via <a href="#mpsc-sender"><code>hub.Sender()</code></a> and sends a value.
+A freshly constructed mpsc hub has no senders, so <code>Recv</code> will block (or <code>TryRecv</code> will report <code>ErrEmpty</code>) until at least one producer is registered via <a href="#mpsc-sender"><code>hub.Sender()</code></a> and sends a value. The "all senders closed ⇒ <code>ErrClosed</code>" rule only kicks in once at least one sender has been registered — a fresh hub is not implicitly closed.
 
 **Hub**
 
@@ -547,11 +547,11 @@ func (h *Hub[T]) Close()
 
 <dl>
   <dt id="mpsc-sender"><code>Sender() gochan.Sender[T]</code></dt>
-  <dd>Returns a new sender bound to the shared queue. Use this to add producers to the fan-in. Each returned sender has its own independent <code>Close</code> state but shares the queue and receiver-close signal with every other sender. Safe to call concurrently. If the receiver or the hub has been closed the returned handle is pre-closed and reports <code>ErrClosed</code> on use.</dd>
+  <dd>Returns a new sender bound to the shared queue. Use this to add producers to the fan-in. Each returned sender has its own independent <code>Close</code> state but shares the queue and receiver-close signal with every other sender. Safe to call concurrently. If the hub has been closed (explicitly via <code>Hub.Close</code>, or implicitly because every previously-registered sender has already closed) or the receiver has been closed, the returned handle is pre-closed and reports <code>ErrClosed</code> on use.</dd>
   <dt><code>Receiver() gochan.Receiver[T]</code></dt>
-  <dd>Returns the singleton receive-side handle. Repeated calls return the same handle. After the hub has been closed the returned handle reports <code>ErrClosed</code> on use.</dd>
+  <dd>Returns the singleton receive-side handle. Repeated calls return the same handle. After the hub has been closed (explicitly via <code>Hub.Close</code>, or implicitly because every previously-registered sender has already closed) the returned handle reports <code>ErrClosed</code> on use.</dd>
   <dt><code>Close()</code></dt>
-  <dd>Equivalent to calling <code>Close</code> on every live sender and on the receiver. For <code>Recv</code>-style callers buffered values are abandoned; <code>Chan</code> consumers can drain them before seeing channel-closed. Future <code>Sender</code> calls return pre-closed handles and future <code>Receiver</code> calls return the (now-closed) singleton handle. Idempotent.</dd>
+  <dd>Equivalent to calling <code>Close</code> on every live sender and on the receiver (receiver first, so an in-flight <code>Send</code> escapes via the dead signal before the underlying channel is closed). For <code>Recv</code>-style callers buffered values are abandoned; <code>Chan</code> consumers can drain them before seeing channel-closed. Future <code>Sender</code> calls return pre-closed handles and future <code>Receiver</code> calls return the (now-closed) singleton handle. Idempotent. Inherits the senders' close discipline — don't call concurrently with an active <code>Send</code> on any sender from another goroutine.</dd>
 </dl>
 
 **Receiver**
@@ -588,13 +588,13 @@ func (tx *Sender[T]) Close()
 
 <dl>
   <dt><code>Send(v) error</code></dt>
-  <dd>Enqueues <code>v</code>. For bounded mpsc, blocks while the buffer is full; for unbounded mpsc, returns as soon as the value is appended. Returns <code>ErrClosed</code> if this sender has been closed or the receiver has been closed; on <code>ErrClosed</code> the value is dropped.</dd>
+  <dd>Enqueues <code>v</code>. For bounded mpsc, blocks while the buffer is full; for unbounded mpsc, returns as soon as the value is appended. Returns <code>ErrClosed</code> if this sender has been closed, the receiver has been closed, or the hub has been closed; on <code>ErrClosed</code> the value is dropped.</dd>
   <dt><code>TrySend(v) error</code></dt>
   <dd>Non-blocking. Returns <code>ErrFull</code> if a bounded buffer is full, <code>ErrClosed</code> if closed, or <code>nil</code> on success. For unbounded mpsc, <code>ErrFull</code> is never returned.</dd>
   <dt><code>SendContext(ctx, v) error</code></dt>
   <dd>Like <code>Send</code>, but returns <code>ctx.Err()</code> if <code>ctx</code> is cancelled before the value is enqueued. The value is dropped on cancellation. For unbounded mpsc, cancellation effectively only matters at entry, since the enqueue itself doesn't block.</dd>
   <dt><code>Close()</code></dt>
-  <dd>Closes this sender only. Other senders continue to produce. Subsequent <code>Send</code>/<code>TrySend</code>/<code>SendContext</code> calls on this handle return <code>ErrClosed</code>. The receiver only observes <code>ErrClosed</code> (after draining) when <em>every</em> sender has been closed. Idempotent.</dd>
+  <dd>Closes this sender only. Other senders continue to produce. Subsequent <code>Send</code>/<code>TrySend</code>/<code>SendContext</code> calls on this handle return <code>ErrClosed</code>. The receiver only observes <code>ErrClosed</code> (after draining) when <em>every</em> sender has been closed. Idempotent. Intended to be called by the producer goroutine that owns this sender — mpsc does not synchronize concurrent callers on the same sender handle.</dd>
 </dl>
 
 **Semantics**
@@ -605,7 +605,7 @@ func (tx *Sender[T]) Close()
   <dt>FIFO across the queue, not across producers</dt>
   <dd>The queue itself preserves the order in which sends arrive at the underlying channel, but the relative ordering of sends from <em>different</em> producers is not defined — it depends on scheduling. Sends from a single producer remain in order with respect to each other.</dd>
   <dt>All senders closed ⇒ receiver drains, then sees ErrClosed</dt>
-  <dd>The receiver does not observe <code>ErrClosed</code> until both (a) every sender obtained from <code>hub.Sender()</code> has been closed and (b) the buffer is empty. If you spawn N producers, you must close all N — a forgotten <code>Close</code> on any one of them leaves the receiver waiting forever for an EOF that never arrives.</dd>
+  <dd>Once at least one sender has been registered, the receiver observes <code>ErrClosed</code> when both (a) every sender obtained from <code>hub.Sender()</code> has been closed and (b) the buffer is empty. A freshly constructed hub with zero senders ever registered is <em>not</em> treated as closed — <code>Recv</code> blocks waiting for the first producer. If you spawn N producers, you must close all N — a forgotten <code>Close</code> on any one of them leaves the receiver waiting forever for an EOF that never arrives.</dd>
   <dt>Receiver close stops everything</dt>
   <dd>Closing the receiver immediately fails every pending and future <code>Send</code> across all senders with <code>ErrClosed</code> and abandons any buffered values.</dd>
   <dt>Bounded vs unbounded backpressure</dt>

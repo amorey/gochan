@@ -8,7 +8,7 @@
 
 ## Introduction
 
-Go channels are extremely useful but they only ship with one type - mpmc (multiple-producer/multiple-consumer), buffered or un-buffered. This means that we often have to add higher level logic to our data structures in order to implement common patterns like single-shot, broadcasts and watches. Inspired by [`Rust channels`](https://doc.rust-lang.org/rust-by-example/std_misc/channels.html), this library adds seven specialized channel types that aren't provided by Go's built-in `chan` type:
+Go channels are extremely useful but they only ship with one type - mpmc (multiple-producer/multiple-consumer), buffered or un-buffered. This means that we often have to add higher level logic to our data structures in order to implement common patterns like oneshot, broadcasts and watches. Inspired by [`Rust channels`](https://doc.rust-lang.org/rust-by-example/std_misc/channels.html), this library adds seven specialized channel types that aren't provided by Go's built-in `chan` type:
 
 | Package     | Senders | Receivers | Semantics                                                  |
 | ----------- | ------- | --------- | ---------------------------------------------------------- |
@@ -55,9 +55,7 @@ if err != nil {
 }
 ```
 
-Docs: [pkg.go.dev/github.com/amorey/gochan/oneshot](https://pkg.go.dev/github.com/amorey/gochan/oneshot)
-
-Examples: [`Recv`](./oneshot/examples/recv/main.go) · [`Chan`](./oneshot/examples/chan/main.go)
+[Recv Example](./oneshot/examples/recv/main.go) · [Chan Example](./oneshot/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gochan/oneshot)
 
 
 ### SPSC (Single-Producer/Single-Consumer)
@@ -79,9 +77,7 @@ for {
 }
 ```
 
-Docs: [pkg.go.dev/github.com/amorey/gochan/spsc](https://pkg.go.dev/github.com/amorey/gochan/spsc)
-
-Examples: [`Recv`](./spsc/examples/recv/main.go) · [`Chan`](./spsc/examples/chan/main.go)
+[Recv Example](./spsc/examples/recv/main.go) · [Chan Example](./spsc/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gochan/spsc)
 
 ### SPMC (Single-Producer/Multiple-Consumer)
 
@@ -108,9 +104,7 @@ for i := 0; i < workers; i++ {
 for _, j := range jobs { tx.Send(j) }
 ```
 
-Docs: [pkg.go.dev/github.com/amorey/gochan/spmc](https://pkg.go.dev/github.com/amorey/gochan/spmc)
-
-Examples: [`Recv`](./spmc/examples/recv/main.go) · [`Chan`](./spmc/examples/chan/main.go)
+[Recv Example](./spmc/examples/recv/main.go) · [Chan Example](./spmc/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gochan/spmc)
 
 ### MPSC (Multiple-Producer/Single-Consumer)
 
@@ -134,9 +128,7 @@ for {
 }
 ```
 
-Docs: [pkg.go.dev/github.com/amorey/gochan/mpsc](https://pkg.go.dev/github.com/amorey/gochan/mpsc)
-
-Examples: [`Recv`](./mpsc/examples/recv/main.go) · [`Chan`](./mpsc/examples/chan/main.go)
+[Recv Example](./mpsc/examples/recv/main.go) · [Chan Example](./mpsc/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gochan/mpsc)
 
 ### MPMC (Multiple-Producer/Multiple-Consumer)
 
@@ -163,9 +155,7 @@ for i := 0; i < workers; i++ {
 }
 ```
 
-Docs: [pkg.go.dev/github.com/amorey/gochan/mpmc](https://pkg.go.dev/github.com/amorey/gochan/mpmc)
-
-Examples: [`Recv`](./mpmc/examples/recv/main.go) · [`Chan`](./mpmc/examples/chan/main.go)
+[Recv Example](./mpmc/examples/recv/main.go) · [Chan Example](./mpmc/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gochan/mpmc)
 
 ### Broadcast
 
@@ -193,9 +183,7 @@ for i := 0; i < listeners; i++ {
 for _, e := range events { tx.Send(e) }
 ```
 
-Docs: [pkg.go.dev/github.com/amorey/gochan/broadcast](https://pkg.go.dev/github.com/amorey/gochan/broadcast)
-
-Examples: [`Recv`](./broadcast/examples/recv/main.go) · [`Chan`](./broadcast/examples/chan/main.go)
+[Recv Example](./broadcast/examples/recv/main.go) · [Chan Example](./broadcast/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gochan/broadcast)
 
 ### Watch
 
@@ -219,9 +207,7 @@ for {
 }
 ```
 
-Docs: [pkg.go.dev/github.com/amorey/gochan/watch](https://pkg.go.dev/github.com/amorey/gochan/watch)
-
-Examples: [`Recv`](./watch/examples/recv/main.go) · [`Chan`](./watch/examples/chan/main.go)
+[Recv Example](./watch/examples/recv/main.go) · [Chan Example](./watch/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gochan/watch)
 
 ## Design notes
 
@@ -284,13 +270,16 @@ All idempotent. Don't call `Hub.Close` concurrently with an active `Send` from a
 
 ### Thread safety
 
-**One handle, one goroutine.** Concurrent `Send`/`Close` (or `Recv`/`Close`) on the same handle is not supported by `oneshot`, `spsc`, `spmc`, `mpsc`, or `mpmc`. For N producers/consumers, mint N handles from the hub.
+**`oneshot`, `spsc`, `spmc`, `mpsc`, `mpmc`**: Concurrent `Send()`/`Close()` (or `Recv()`/`Close()`) on the same handle is not supported. To avoid any cross-thread race conditions, don't share handles across goroutines.
 
-Exception: `broadcast` and `watch` `Sender` is safe to share across goroutines — `Send` never parks (it overwrites), so there's no race window with `Close`.
+**`broadcast`, `watch`**: Concurrent `Send()`/`Close()` is safe to share across goroutines.
+
+### Chan support
 
 `Chan()` comes in two flavors:
 
 - **Queue-style** (`spsc`, `spmc`, `mpsc`, `mpmc`): exposes the underlying buffered channel. `Receiver.Close()` does *not* close it — use `Recv`/`TryRecv` to observe receiver-close. It closes only when the sender closes and the buffer drains.
+
 - **Per-receiver feeder** (`broadcast`, `watch`): private channel fed by a per-receiver goroutine. `Receiver.Close()` *does* close it; always `Close` the receiver when done or the feeder leaks.
 
 For `oneshot`, `Chan()` is the one-slot delivery channel; sender-close closes it after the value is observed.

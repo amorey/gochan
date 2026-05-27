@@ -246,6 +246,28 @@ func TestSenderCloseIdempotent(t *testing.T) {
 	tx.Close()
 }
 
+func TestHubCloseClosesSenderOnly(t *testing.T) {
+	h := newHub[int](t, 7)
+	tx := newTx(t, h)
+	rx := newRx(t, h)
+
+	h.Close()
+
+	// Sender is closed.
+	assert.ErrorIs(t, tx.Send(1), gochan.ErrClosed)
+
+	// Receiver is unaffected: it still drains the final (initial)
+	// value once before reporting ErrClosed.
+	v, err := rx.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, 7, v)
+	_, err = rx.Recv()
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+
+	// Idempotent.
+	h.Close()
+}
+
 func TestReceiverCloseIdempotent(t *testing.T) {
 	h := newHub[int](t, 0)
 	rx := newRx(t, h)

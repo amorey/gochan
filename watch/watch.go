@@ -72,19 +72,20 @@
 // standard "final state" pattern — shutdown signals carrying a final
 // reason, last-known-good config on close, etc.
 //
-// No Hub close-all. Unlike the other multi-side packages, watch's
-// Hub has no Close method: there is no meaningful "close everything"
-// operation because receivers are independent of the sender's
-// lifecycle (a live receiver can outlive the sender to observe the
-// final value, and the sender can outlive every receiver and keep
-// publishing for future ones). To shut down the publisher, call
-// [Sender.Close] directly via hub.Sender().Close(). Live receivers
-// then observe sender-close through the normal drain path: those
-// that had not yet observed the latest value may still receive it
-// once via Recv / Chan; receivers already caught up see
-// [gochan.ErrClosed] immediately. A receiver obtained from a hub
-// whose sender has already been closed likewise delivers the final
-// value once before ErrClosed.
+// Hub close-all is sender-only. Unlike the other multi-side packages,
+// watch's [Hub.Close] only closes the sender — it does not close live
+// receivers. Receivers are independent of the sender's lifecycle: a
+// live receiver can outlive the sender to observe the final value,
+// and tearing receivers down on hub-close would defeat that pattern.
+// [Hub.Close] is provided purely as a consistency convenience so
+// `defer hub.Close()` does the right thing for callers switching
+// between channel types; it is exactly equivalent to
+// `hub.Sender().Close()`. Live receivers observe sender-close through
+// the normal drain path: those that had not yet observed the latest
+// value may still receive it once via Recv / Chan; receivers already
+// caught up see [gochan.ErrClosed] immediately. A receiver obtained
+// from a hub whose sender has already been closed likewise delivers
+// the final value once before ErrClosed.
 package watch
 
 import (
@@ -184,6 +185,13 @@ func (h *Hub[T]) Receiver() *Receiver[T] {
 	rx.done.Init()
 	return rx
 }
+
+// Close is a convenience wrapper around hub.Sender().Close(). It does
+// not close live receivers — they remain independent of the sender's
+// lifecycle and observe sender-close through the normal drain path
+// (see the package doc). Provided so callers switching between
+// channel types can use `defer hub.Close()` uniformly. Idempotent.
+func (h *Hub[T]) Close() { h.tx.Close() }
 
 // Send publishes v as the new current value. Never blocks. If a
 // receiver has not yet observed the previous value, that value is

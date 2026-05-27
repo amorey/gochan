@@ -16,12 +16,15 @@
 //
 // Send never blocks: slow receivers cannot apply backpressure to the
 // publisher — they just skip ahead to the newest value on their next
-// read. Closing the sender does not immediately fail in-flight Recv
-// calls on receivers that have not yet observed the final value: each
-// such receiver gets one more Recv returning the latest value before
-// subsequent calls return [gochan.ErrClosed]. Closing a receiver,
-// by contrast, fails further Recv calls on that handle immediately —
-// any unseen pending value is abandoned.
+// read. Closing the sender (via [Sender.Close]) does not immediately
+// fail in-flight Recv calls on receivers that have not yet observed
+// the final value: each such receiver gets one more Recv returning
+// the latest value before subsequent calls return [gochan.ErrClosed].
+// Closing a receiver, by contrast, fails further Recv calls on that
+// handle immediately — any unseen pending value is abandoned. Closing
+// the hub (via [Hub.Close]) is hard tear-down: the sender and every
+// live receiver are closed immediately, with no final-value drain —
+// use [Sender.Close] if you need the soft path.
 //
 // # Typical uses
 //
@@ -72,20 +75,17 @@
 // standard "final state" pattern — shutdown signals carrying a final
 // reason, last-known-good config on close, etc.
 //
-// Hub close-all is sender-only. Unlike the other multi-side packages,
-// watch's [Hub.Close] only closes the sender — it does not close live
-// receivers. Receivers are independent of the sender's lifecycle: a
-// live receiver can outlive the sender to observe the final value,
-// and tearing receivers down on hub-close would defeat that pattern.
-// [Hub.Close] is provided purely as a consistency convenience so
-// `defer hub.Close()` does the right thing for callers switching
-// between channel types; it is exactly equivalent to
-// `hub.Sender().Close()`. Live receivers observe sender-close through
-// the normal drain path: those that had not yet observed the latest
-// value may still receive it once via Recv / Chan; receivers already
-// caught up see [gochan.ErrClosed] immediately. A receiver obtained
-// from a hub whose sender has already been closed likewise delivers
-// the final value once before ErrClosed.
+// Hub close-all is hard tear-down. [Hub.Close] closes the sender and
+// every live receiver immediately. Recv / TryRecv / RecvContext
+// return [gochan.ErrClosed] without delivering the current value,
+// Chan feeders exit and close their channel, and future
+// [Hub.Receiver] calls return pre-closed handles. Use [Sender.Close]
+// if you want subscribers to observe the latest value once before
+// shutdown (the standard "final state" pattern — shutdown signals
+// carrying a final reason, last-known-good config on close, etc.).
+// A receiver obtained from a hub whose sender has been closed via
+// [Sender.Close] (but not [Hub.Close]) still delivers the final
+// value once before ErrClosed.
 package watch
 
 import (
@@ -105,10 +105,12 @@ type shared[T any] struct {
 	version  atomic.Uint64
 	txClosed atomic.Bool
 
-	mu      sync.Mutex
-	val     T
-	notify  chan struct{} // closed (and replaced) on every state change
-	waiters int           // parked receivers; gates notify-channel allocation
+	mu        sync.Mutex
+	val       T
+	notify    chan struct{} // closed (and replaced) on every state change
+	waiters   int           // parked receivers; gates notify-channel allocation
+	receivers map[*Receiver[T]]struct{}
+	hubClosed bool
 }
 
 // signalLocked wakes parked receivers if any. Caller must hold s.mu.
@@ -159,8 +161,9 @@ type Receiver[T any] struct {
 // snapshot the slot.
 func New[T any](initial T) *Hub[T] {
 	s := &shared[T]{
-		val:    initial,
-		notify: make(chan struct{}),
+		val:       initial,
+		notify:    make(chan struct{}),
+		receivers: make(map[*Receiver[T]]struct{}),
 	}
 	s.version.Store(1)
 	return &Hub[T]{s: s, tx: &Sender[T]{s: s}}
@@ -177,21 +180,45 @@ func (h *Hub[T]) Sender() *Sender[T] { return h.tx }
 // first Recv returns whatever value is current at the time of that
 // first Recv (not at the time of this call — registration does not
 // snapshot the slot); subsequent Recv calls block until the value
-// changes again. If the hub has already been closed the receiver
-// still delivers the final value once (its lastSeen=0 < version)
-// before subsequent calls return [gochan.ErrClosed].
+// changes again. If the hub has already been closed via [Hub.Close]
+// the returned handle is pre-closed and reports [gochan.ErrClosed]
+// on use. If only the sender has been closed (via [Sender.Close])
+// the receiver still delivers the final value once before subsequent
+// calls return ErrClosed.
 func (h *Hub[T]) Receiver() *Receiver[T] {
 	rx := &Receiver[T]{s: h.s}
 	rx.done.Init()
+	h.s.mu.Lock()
+	if h.s.hubClosed {
+		rx.done.Close()
+	} else {
+		h.s.receivers[rx] = struct{}{}
+	}
+	h.s.mu.Unlock()
 	return rx
 }
 
-// Close is a convenience wrapper around hub.Sender().Close(). It does
-// not close live receivers — they remain independent of the sender's
-// lifecycle and observe sender-close through the normal drain path
-// (see the package doc). Provided so callers switching between
-// channel types can use `defer hub.Close()` uniformly. Idempotent.
-func (h *Hub[T]) Close() { h.tx.Close() }
+// Close closes the sender and every live receiver. Receivers see
+// [gochan.ErrClosed] immediately — the final-value drain is not
+// performed; use [Sender.Close] if you need subscribers to observe
+// the latest value once before shutdown. Future [Hub.Receiver] calls
+// return pre-closed handles. Idempotent.
+func (h *Hub[T]) Close() {
+	s := h.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.hubClosed {
+		return
+	}
+	s.hubClosed = true
+	s.txClosed.Store(true)
+	// Closing each receiver's done wakes its parked Recv/feed
+	// directly, so there's no need to also fire s.notify.
+	for rx := range s.receivers {
+		rx.done.Close()
+	}
+	s.receivers = nil
+}
 
 // Send publishes v as the new current value. Never blocks. If a
 // receiver has not yet observed the previous value, that value is
@@ -299,6 +326,7 @@ func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 			return v, nil
 		}
 		if rx.s.txClosed.Load() {
+			delete(rx.s.receivers, rx)
 			rx.s.mu.Unlock()
 			return z, gochan.ErrClosed
 		}
@@ -330,6 +358,11 @@ func (rx *Receiver[T]) TryRecv() (T, error) {
 	// mu. rx.lastSeen is owned by this goroutine.
 	if rx.s.version.Load() == rx.lastSeen {
 		if rx.s.txClosed.Load() {
+			// Terminal: deregister so a long-lived hub doesn't pin
+			// an abandoned receiver after a Sender.Close soft drain.
+			rx.s.mu.Lock()
+			delete(rx.s.receivers, rx)
+			rx.s.mu.Unlock()
 			return z, gochan.ErrClosed
 		}
 		return z, gochan.ErrEmpty
@@ -423,6 +456,7 @@ func (rx *Receiver[T]) feed() {
 			continue
 		}
 		if s.txClosed.Load() {
+			delete(s.receivers, rx)
 			s.mu.Unlock()
 			return
 		}
@@ -451,5 +485,6 @@ func (rx *Receiver[T]) Close() {
 	// stable as long as Close serializes through mu too.
 	rx.s.mu.Lock()
 	rx.done.Close()
+	delete(rx.s.receivers, rx)
 	rx.s.mu.Unlock()
 }

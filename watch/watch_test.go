@@ -246,7 +246,7 @@ func TestSenderCloseIdempotent(t *testing.T) {
 	tx.Close()
 }
 
-func TestHubCloseClosesSenderOnly(t *testing.T) {
+func TestHubCloseHardClosesSenderAndReceivers(t *testing.T) {
 	h := newHub[int](t, 7)
 	tx := newTx(t, h)
 	rx := newRx(t, h)
@@ -256,16 +256,140 @@ func TestHubCloseClosesSenderOnly(t *testing.T) {
 	// Sender is closed.
 	assert.ErrorIs(t, tx.Send(1), gochan.ErrClosed)
 
-	// Receiver is unaffected: it still drains the final (initial)
-	// value once before reporting ErrClosed.
-	v, err := rx.Recv()
-	require.NoError(t, err)
-	assert.Equal(t, 7, v)
-	_, err = rx.Recv()
+	// Live receiver sees ErrClosed immediately — no final-value drain.
+	_, err := rx.Recv()
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+	_, err = rx.TryRecv()
 	assert.ErrorIs(t, err, gochan.ErrClosed)
 
 	// Idempotent.
 	h.Close()
+}
+
+func TestHubCloseReceiverObtainedAfterIsPreClosed(t *testing.T) {
+	h := newHub[int](t, 7)
+	h.Close()
+
+	rx := newRx(t, h)
+	_, err := rx.Recv()
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+	_, err = rx.TryRecv()
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+}
+
+func TestHubCloseWakesBlockedRecv(t *testing.T) {
+	h := newHub[int](t, 0)
+	rx := newRx(t, h)
+	// Drain initial so the next Recv blocks.
+	_, err := rx.Recv()
+	require.NoError(t, err)
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := rx.Recv()
+		errCh <- err
+	}()
+
+	h.Close()
+
+	select {
+	case err := <-errCh:
+		assert.ErrorIs(t, err, gochan.ErrClosed)
+	case <-time.After(time.Second):
+		t.Fatal("blocked Recv was not woken by Hub.Close")
+	}
+}
+
+func TestHubCloseClosesChan(t *testing.T) {
+	h := newHub[int](t, 0)
+	rx := newRx(t, h)
+	ch := rx.Chan()
+	// Drain initial.
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("initial value not delivered")
+	}
+
+	h.Close()
+
+	select {
+	case _, ok := <-ch:
+		assert.False(t, ok, "channel should be closed after Hub.Close")
+	case <-time.After(time.Second):
+		t.Fatal("Chan was not closed by Hub.Close")
+	}
+}
+
+func TestSoftCloseDoesNotLeakReceivers(t *testing.T) {
+	// Regression guard: receivers that observe a terminal ErrClosed
+	// via the Sender.Close soft path must deregister from the hub's
+	// receiver registry, otherwise long-lived hubs leak each
+	// abandoned receiver until Hub.Close.
+	h := newHub[int](t, 0)
+	tx := newTx(t, h)
+	tx.Close()
+
+	for i := 0; i < 50; i++ {
+		rx := h.Receiver()
+		_, err := rx.Recv() // drains final value
+		require.NoError(t, err)
+		_, err = rx.Recv() // terminal ErrClosed → deregister
+		require.ErrorIs(t, err, gochan.ErrClosed)
+	}
+	assert.Equal(t, 0, h.ReceiverCount(), "receivers should deregister on terminal ErrClosed")
+}
+
+func TestSoftCloseTryRecvDeregisters(t *testing.T) {
+	h := newHub[int](t, 0)
+	tx := newTx(t, h)
+	rx := h.Receiver()
+	_, err := rx.Recv() // drains initial
+	require.NoError(t, err)
+	tx.Close()
+
+	_, err = rx.TryRecv()
+	require.ErrorIs(t, err, gochan.ErrClosed)
+	assert.Equal(t, 0, h.ReceiverCount())
+}
+
+func TestSoftCloseFeedDeregisters(t *testing.T) {
+	h := newHub[int](t, 0)
+	tx := newTx(t, h)
+	rx := h.Receiver()
+	ch := rx.Chan()
+	// Drain initial.
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("initial not delivered")
+	}
+	tx.Close()
+	// Wait for feeder exit via channel close.
+	select {
+	case _, ok := <-ch:
+		assert.False(t, ok)
+	case <-time.After(time.Second):
+		t.Fatal("Chan not closed after sender close")
+	}
+	assert.Equal(t, 0, h.ReceiverCount())
+}
+
+func TestSenderCloseStillDeliversFinalValueAfterHubChange(t *testing.T) {
+	// Regression guard: tightening Hub.Close must not break the
+	// Sender.Close soft-drain path.
+	h := newHub[int](t, 0)
+	tx := newTx(t, h)
+	rx := newRx(t, h)
+	require.NoError(t, tx.Send(99))
+
+	tx.Close()
+
+	v, err := rx.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, 99, v)
+	_, err = rx.Recv()
+	assert.ErrorIs(t, err, gochan.ErrClosed)
 }
 
 func TestReceiverCloseIdempotent(t *testing.T) {

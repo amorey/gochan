@@ -26,9 +26,10 @@ semantics tables, error meanings). When changing public behavior, update
   different goroutine.
 - `spmc/`, `mpsc/`, `mpmc/`, `broadcast/`, `watch/` — multi-side packages.
   Constructors return `*Hub[T]`; handles are minted via `hub.Sender()` /
-  `hub.Receiver()` and `hub.Close()` is close-all. `watch` is the exception:
-  its `Hub.Close()` exists as a consistency convenience but closes only the
-  sender — see Conventions below.
+  `hub.Receiver()` and `hub.Close()` is close-all (hard tear-down across
+  all packages). For `watch`, use `Sender.Close()` if you want subscribers
+  to observe the final value once before shutdown — `Hub.Close()` skips
+  that drain.
 - `internal/chancore/` — shared building blocks used by the chan-backed
   packages (`spsc`, `spmc`, `mpsc`, `mpmc`). Not part of the public API.
   - `CloseOnce` — one-shot termination signal (atomic flag + done channel).
@@ -47,13 +48,11 @@ semantics tables, error meanings). When changing public behavior, update
   capacity. `broadcast.New[T](0)` panics; the other queue constructors
   accept `0` as rendezvous and panic on negative capacity.
 - Handle `Close()` is always idempotent. Close-all is equivalent to calling
-  `Close()` on every handle the hub has handed out. `watch` is the exception:
-  its `Hub.Close()` closes only the sender, not live receivers, because
-  receivers are independent of the sender's lifecycle (a live receiver can
-  outlive the sender to observe the final value, and the sender can outlive
-  every receiver and keep publishing for future ones). `watch.Hub.Close()`
-  exists purely as a consistency shim so `defer hub.Close()` works uniformly
-  across channel types; it is exactly equivalent to `hub.Sender().Close()`.
+  `Close()` on every handle the hub has handed out, across every multi-side
+  package. In `watch`, `Hub.Close()` is therefore hard tear-down (sender +
+  every live receiver, no final-value drain); call `Sender.Close()` instead
+  if you want the soft drain pattern where receivers observe the latest
+  value once before ErrClosed.
 - `Receiver.Chan()` close behavior depends on the package family:
   - Queue-style (`spsc`, `spmc`, `mpsc`, `mpmc`): the channel is the shared
     buffer; `Receiver.Close()` does *not* close it. It only closes when

@@ -23,17 +23,26 @@ import (
 
 func main() {
 	tx, rx := oneshot.New[int]()
+	// Both Closes are idempotent and safe after a successful Send/Recv,
+	// so deferring them guarantees cleanup on every exit path. On the
+	// timeout path, rx.Close() also tells a still-pending Send to drop
+	// its value rather than block.
+	defer tx.Close()
+	defer rx.Close()
 
 	// Worker computes a result and sends it once. Send returns immediately —
 	// it does not block on a receiver — so the worker never leaks even if
 	// the main goroutine has already moved on.
 	go func() {
 		time.Sleep(50 * time.Millisecond) // simulate work
-		_ = tx.Send(42)
+		if err := tx.Send(42); err != nil {
+			// ErrClosed here means the receiver gave up (e.g. timed out)
+			// before we sent — the value is dropped.
+			fmt.Println("send failed:", err)
+		}
 	}()
 
-	// Bound the wait with a context. If the deadline fires first we close
-	// the receiver to signal the worker that nobody will read its result.
+	// Bound the wait with a context.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
@@ -42,7 +51,6 @@ func main() {
 		// Possible errors:
 		//   - context deadline / cancellation (we timed out)
 		//   - gochan.ErrClosed (worker closed without sending)
-		rx.Close() // graceful shutdown: drop any value the worker may still send
 		if errors.Is(err, gochan.ErrClosed) {
 			fmt.Println("worker cancelled before sending")
 			return

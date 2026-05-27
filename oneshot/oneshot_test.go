@@ -283,4 +283,3 @@ func TestSendRecvCloseRace(t *testing.T) {
 		}
 	}
 }
-

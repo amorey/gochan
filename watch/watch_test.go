@@ -205,7 +205,7 @@ func TestSenderCloseCaughtUpReceiverSeesErrClosed(t *testing.T) {
 	assert.ErrorIs(t, err, gochan.ErrClosed)
 }
 
-func TestHubCloseLiveReceiverDrainsFinalValue(t *testing.T) {
+func TestSenderCloseLiveReceiverDrainsFinalValue(t *testing.T) {
 	h := newHub[int](t, 1)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
@@ -213,7 +213,7 @@ func TestHubCloseLiveReceiverDrainsFinalValue(t *testing.T) {
 	_, _ = rx.Recv()
 	require.NoError(t, tx.Send(42))
 
-	h.Close()
+	tx.Close()
 	assert.ErrorIs(t, tx.Send(0), gochan.ErrClosed)
 
 	v, err := rx.Recv()
@@ -224,25 +224,19 @@ func TestHubCloseLiveReceiverDrainsFinalValue(t *testing.T) {
 	assert.ErrorIs(t, err, gochan.ErrClosed)
 }
 
-func TestPostHubCloseReceiverDeliversFinalThenClosed(t *testing.T) {
+func TestPostSenderCloseReceiverDeliversFinalThenClosed(t *testing.T) {
 	h := newHub[int](t, 5)
 	tx := newTx(t, h)
 	require.NoError(t, tx.Send(6))
-	h.Close()
+	tx.Close()
 
-	rx := newRx(t, h) // obtained after hub close
+	rx := newRx(t, h) // obtained after sender close
 	v, err := rx.Recv()
 	require.NoError(t, err)
 	assert.Equal(t, 6, v, "post-close receiver should see the final value")
 
 	_, err = rx.Recv()
 	assert.ErrorIs(t, err, gochan.ErrClosed)
-}
-
-func TestHubCloseIdempotent(t *testing.T) {
-	h := newHub[int](t, 0)
-	h.Close()
-	h.Close()
 }
 
 func TestSenderCloseIdempotent(t *testing.T) {

@@ -1,9 +1,10 @@
 // Package oneshot provides a single-value, single-delivery channel.
 //
 // Exactly one Send will ever succeed and the value is delivered to exactly
-// one Recv. [New] hands out a sender, a receiver, and a close function
-// that calls Close on both. Either side may cancel by closing its handle,
-// and the other side observes [gochan.ErrClosed] on its next operation.
+// one Recv. [New] hands out a sender and a receiver; each side is closed
+// via its own [Sender.Close] / [Receiver.Close]. Either side may cancel
+// by closing its handle, and the other side observes [gochan.ErrClosed]
+// on its next operation.
 //
 // # Typical uses
 //
@@ -28,10 +29,6 @@
 // that completes its work and then has its receiver vanish never leaks.
 // Conversely, a Recv caller that wants to bail must use [Receiver.RecvContext]
 // or [Receiver.Close].
-//
-// Close-all. The close function returned by [New] calls Close on both
-// handles. The pending value (if any) is dropped, and both Send and Recv
-// return [gochan.ErrClosed]. Convenient as a defer.
 package oneshot
 
 import (
@@ -61,17 +58,12 @@ type Sender[T any] struct{ s *shared[T] }
 // Receiver is the receive-side handle of a oneshot pair.
 type Receiver[T any] struct{ s *shared[T] }
 
-// New creates a fresh oneshot pair: a sender, a receiver, and a close
-// function that calls Close on both. The close function is idempotent and
-// safe to defer.
-func New[T any]() (*Sender[T], *Receiver[T], func()) {
+// New creates a fresh oneshot pair: a sender and a receiver. Each side
+// is closed independently via [Sender.Close] / [Receiver.Close]; both
+// are idempotent.
+func New[T any]() (*Sender[T], *Receiver[T]) {
 	s := &shared[T]{done: make(chan struct{})}
-	tx := &Sender[T]{s: s}
-	rx := &Receiver[T]{s: s}
-	return tx, rx, func() {
-		rx.Close()
-		tx.Close()
-	}
+	return &Sender[T]{s: s}, &Receiver[T]{s: s}
 }
 
 // Send deposits v into the slot and returns immediately without waiting for a

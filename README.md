@@ -46,8 +46,9 @@ Oneshot is a single-value, single-delivery non-blocking channel that delivers ex
 Docs: [pkg.go.dev/github.com/amorey/gochan/oneshot](https://pkg.go.dev/github.com/amorey/gochan/oneshot)
 
 ```go
-tx, rx, closeAll := oneshot.New[Result]()
-defer closeAll()
+tx, rx := oneshot.New[Result]()
+defer tx.Close()
+defer rx.Close()
 
 go func() { tx.Send(compute()) }()
 result, err := rx.Recv()
@@ -63,12 +64,12 @@ SPSC is a bounded FIFO queue between exactly one sender and exactly one receiver
 Docs: [pkg.go.dev/github.com/amorey/gochan/spsc](https://pkg.go.dev/github.com/amorey/gochan/spsc)
 
 ```go
-tx, rx, closeAll := spsc.New[int](64)
-defer closeAll()
+tx, rx := spsc.New[int](64)
+defer rx.Close()
 
 go func() {
+    defer tx.Close()
     for i := 0; i < 10; i++ { tx.Send(i) }
-    tx.Close()
 }()
 for {
     v, err := rx.Recv()
@@ -86,7 +87,9 @@ Docs: [pkg.go.dev/github.com/amorey/gochan/spmc](https://pkg.go.dev/github.com/a
 ```go
 hub := spmc.New[Job](128)
 defer hub.Close()
+
 tx := hub.Sender()
+defer tx.Close()
 
 for i := 0; i < workers; i++ {
     rx := hub.Receiver()
@@ -100,7 +103,6 @@ for i := 0; i < workers; i++ {
     }()
 }
 for _, j := range jobs { tx.Send(j) }
-tx.Close()
 ```
 
 ### MPSC (Multiple-Producer/Single-Consumer)
@@ -112,11 +114,13 @@ Docs: [pkg.go.dev/github.com/amorey/gochan/mpsc](https://pkg.go.dev/github.com/a
 ```go
 hub := mpsc.New[Event](256)
 defer hub.Close()
+
 rx := hub.Receiver()
+defer rx.Close()
 
 for i := 0; i < n; i++ {
-    s := hub.Sender()
-    go func() { defer s.Close(); produce(s) }()
+    tx := hub.Sender()
+    go func() { defer tx.Close(); produce(tx) }()
 }
 for {
     ev, err := rx.Recv()
@@ -136,8 +140,8 @@ hub := mpmc.New[Task](256)
 defer hub.Close()
 
 for i := 0; i < producers; i++ {
-    s := hub.Sender()
-    go func() { defer s.Close(); produce(s) }()
+    tx := hub.Sender()
+    go func() { defer tx.Close(); produce(tx) }()
 }
 for i := 0; i < workers; i++ {
     rx := hub.Receiver()
@@ -161,7 +165,9 @@ Docs: [pkg.go.dev/github.com/amorey/gochan/broadcast](https://pkg.go.dev/github.
 ```go
 hub := broadcast.New[Event](64)
 defer hub.Close()
+
 tx := hub.Sender()
+defer tx.Close()
 
 for i := 0; i < listeners; i++ {
     rx := hub.Receiver()
@@ -176,7 +182,6 @@ for i := 0; i < listeners; i++ {
     }()
 }
 for _, e := range events { tx.Send(e) }
-tx.Close()
 ```
 
 ### Watch
@@ -187,12 +192,11 @@ Docs: [pkg.go.dev/github.com/amorey/gochan/watch](https://pkg.go.dev/github.com/
 
 ```go
 hub := watch.New[Config](initial)
-defer hub.Close()
 tx := hub.Sender()
 
 go func() {
+    defer tx.Close()
     for c := range updates { tx.Send(c) }
-    tx.Close()
 }()
 
 rx := hub.Receiver()
@@ -227,18 +231,20 @@ type Receiver[T any] interface {
 }
 ```
 
-Multi-side packages (`spmc`, `mpsc`, `mpmc`, `broadcast`, `watch`) each expose their own concrete `*Hub[T]` type. There is intentionally no shared `Hub` interface: the semantics differ enough between packages (e.g. `mpmc` drops nothing while `broadcast` returns `ErrLagged`) that being able to swap one for another behind a single interface would be a footgun. Every hub has the same three-method shape:
+Multi-side packages (`spmc`, `mpsc`, `mpmc`, `broadcast`, `watch`) each expose their own concrete `*Hub[T]` type. There is intentionally no shared `Hub` interface: the semantics differ enough between packages (e.g. `mpmc` drops nothing while `broadcast` returns `ErrLagged`) that being able to swap one for another behind a single interface would be a footgun. Every hub has the same shape:
 
 ```go
 // On each package's *Hub[T]:
 Sender()   *Sender[T]    // fresh handle on multi-Sender packages; the singleton on single-Sender packages
 Receiver() *Receiver[T]  // same shape for the receive side
-Close()                  // closes every live handle; idempotent (watch.Hub.Close closes only the sender)
+Close()                  // closes every live handle; idempotent (watch has no Hub.Close — see below)
 ```
 
-On singleton-side architectures (e.g. spmc's `Sender`, mpsc's `Receiver`), repeated calls return the same handle — `Sender()` and `Receiver()` are idempotent getters there. On multi-side architectures they hand out a fresh handle each call. After the hub has been closed, the returned handle reports `ErrClosed` on use; you don't have to check up-front. (A receiver obtained from a closed `watch` hub delivers the final published value once before reporting `ErrClosed`.)
+On singleton-side architectures (e.g. spmc's `Sender`, mpsc's `Receiver`), repeated calls return the same handle — `Sender()` and `Receiver()` are idempotent getters there. On multi-side architectures they hand out a fresh handle each call. After the hub has been closed, the returned handle reports `ErrClosed` on use; you don't have to check up-front.
 
-Singleton-pair packages (`oneshot`, `spsc`) have no hub at all. Their constructors return `(*Sender[T], *Receiver[T], func())` directly — both handles plus a close-all function — giving a compile-time guarantee that the handles cannot be requested twice.
+`watch` is the exception: its `Hub` has no `Close` method, because receivers are independent of the sender's lifecycle (a live receiver can outlive the sender to observe the final value, and the sender can outlive every receiver and keep publishing for future ones). Shut down a watch publisher with `hub.Sender().Close()` directly. A receiver obtained from a hub whose sender has already been closed delivers the final published value once before reporting `ErrClosed`.
+
+Singleton-pair packages (`oneshot`, `spsc`) have no hub at all. Their constructors return `(*Sender[T], *Receiver[T])` directly, giving a compile-time guarantee that the handles cannot be requested twice. There is no close-all aggregator — each side is closed via its own `Close()`, matching the typical pattern of handing the two ends to different goroutines that each own their side's lifecycle.
 
 ### Errors
 
@@ -259,15 +265,15 @@ type ErrLagged struct{ Missed uint64 }  // broadcast only
 
 ### Close semantics
 
-There are two close operations: per-handle (`Sender.Close()` / `Receiver.Close()`), and close-all (`Hub.Close()` or the function returned by `oneshot.New` / `spsc.New`). Close-all is equivalent to calling `Close()` on every handle the hub has handed out which means it isn't strictly necessary but it's a convenient catch-all.
+There are two close operations: per-handle (`Sender.Close()` / `Receiver.Close()`), and close-all (`Hub.Close()` on the multi-side hub packages). Close-all is equivalent to calling `Close()` on every handle the hub has handed out — it isn't strictly necessary but it's a convenient catch-all. `watch` has no `Hub.Close` (see above) and the singleton-pair packages (`oneshot`, `spsc`) have no hub at all; close each side directly in those cases.
 
 | Call                | Effect                                                                                                    |
 | ------------------- | --------------------------------------------------------------------------------------------------------- |
 | `Sender.Close()`    | Graceful end-of-stream. On queue-style channels, buffered values remain receivable; `Recv` and `Chan` drain them, then see `ErrClosed` / channel-closed. |
 | `Receiver.Close()`  | This handle only. On multi-receiver hubs, other receivers and the sender keep running. Buffered values are abandoned for `Recv` on this handle. |
-| close-all           | `Hub.Close()` on hub-style packages, or the third return value from the constructor on singleton-pair packages. Equivalent to receiver(s) `Close` then sender `Close`: Recv-style callers see `ErrClosed` immediately (the receiver close runs first); `Chan` consumers drain remaining values before seeing closed. |
+| `Hub.Close()`       | Hub-style packages only (not `watch`). Equivalent to calling `Close` on every receiver and then the sender: Recv-style callers see `ErrClosed` immediately (the receiver close runs first); `Chan` consumers drain remaining values before seeing closed. |
 
-All three are idempotent. The close-all inherits the sender's close discipline — don't call it concurrently with an active `Send` from a different goroutine.
+All are idempotent. `Hub.Close` inherits the sender's close discipline — don't call it concurrently with an active `Send` from a different goroutine.
 
 ### Thread safety
 
@@ -277,7 +283,7 @@ The two exceptions are `broadcast` and `watch`: their `Sender` is explicitly saf
 
 The `Chan()` method on every receiver gives you a native `chan` for use in `select`. Two flavors depending on the package:
 
-- **Queue-style shared channels** (`spsc`, `spmc`, `mpsc`, `mpmc`): `Chan()` exposes the underlying buffered channel that the sender writes into. Closing the receiver does *not* close `Chan()` — use `Recv`/`TryRecv` if you need to observe receiver-close. The channel closes only when the sender closes (directly or via close-all) and the buffer drains, the same as `close()` on a raw Go channel.
+- **Queue-style shared channels** (`spsc`, `spmc`, `mpsc`, `mpmc`): `Chan()` exposes the underlying buffered channel that the sender writes into. Closing the receiver does *not* close `Chan()` — use `Recv`/`TryRecv` if you need to observe receiver-close. The channel closes only when the sender closes (directly or via `Hub.Close`) and the buffer drains, the same as `close()` on a raw Go channel.
 
 - **Per-receiver feeder channels** (`broadcast`, `watch`): `Chan()` returns a private channel fed by a per-receiver goroutine. Closing the receiver *does* close `Chan()` (the feeder shuts down), and so does sender-close after the feeder drains its last value. Always `Close` the receiver when you stop reading, or the feeder goroutine pins itself waiting for the next value.
 

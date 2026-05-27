@@ -72,15 +72,19 @@
 // standard "final state" pattern — shutdown signals carrying a final
 // reason, last-known-good config on close, etc.
 //
-// Hub close-all. [Hub.Close] closes only the sender — this is an
-// intentional exception to the close-everything pattern the other
-// multi-side packages follow, so that live receivers can still observe
-// the final published value. Live receivers observe sender-close
-// through the normal drain path: those that had not yet observed the
-// latest value may still receive it once via Recv / Chan; receivers
-// already caught up see [gochan.ErrClosed] immediately. A receiver
-// obtained from a hub that has already been closed likewise delivers
-// the final value once before ErrClosed.
+// No Hub close-all. Unlike the other multi-side packages, watch's
+// Hub has no Close method: there is no meaningful "close everything"
+// operation because receivers are independent of the sender's
+// lifecycle (a live receiver can outlive the sender to observe the
+// final value, and the sender can outlive every receiver and keep
+// publishing for future ones). To shut down the publisher, call
+// [Sender.Close] directly via hub.Sender().Close(). Live receivers
+// then observe sender-close through the normal drain path: those
+// that had not yet observed the latest value may still receive it
+// once via Recv / Chan; receivers already caught up see
+// [gochan.ErrClosed] immediately. A receiver obtained from a hub
+// whose sender has already been closed likewise delivers the final
+// value once before ErrClosed.
 package watch
 
 import (
@@ -180,14 +184,6 @@ func (h *Hub[T]) Receiver() *Receiver[T] {
 	rx.done.Init()
 	return rx
 }
-
-// Close closes the sender. Live receivers that have not yet observed
-// the latest value may still receive it once via Recv / TryRecv / Chan
-// before subsequent operations return [gochan.ErrClosed]; receivers
-// already caught up see ErrClosed immediately. Future Sender calls
-// return the closed singleton; future Receiver calls return handles
-// that deliver the final value once and then ErrClosed. Idempotent.
-func (h *Hub[T]) Close() { h.tx.Close() }
 
 // Send publishes v as the new current value. Never blocks. If a
 // receiver has not yet observed the previous value, that value is

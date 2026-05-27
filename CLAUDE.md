@@ -23,7 +23,8 @@ semantics tables, error meanings). When changing public behavior, update
   `(*Sender[T], *Receiver[T], func())`; the `func()` is close-all.
 - `spmc/`, `mpsc/`, `mpmc/`, `broadcast/`, `watch/` — multi-side packages.
   Constructors return `*Hub[T]`; handles are minted via `hub.Sender()` /
-  `hub.Receiver()` and `hub.Close()` is close-all.
+  `hub.Receiver()` and `hub.Close()` is close-all (except `watch.Hub.Close`,
+  which closes only the sender — see Conventions below).
 - `internal/chancore/` — shared building blocks used by the chan-backed
   packages (`spsc`, `spmc`, `mpsc`, `mpmc`). Not part of the public API.
   - `CloseOnce` — one-shot termination signal (atomic flag + done channel).

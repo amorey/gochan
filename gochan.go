@@ -5,11 +5,11 @@ import "context"
 // Sender is the common send-side interface implemented by every channel type
 // in this module.
 type Sender[T any] interface {
-	// Send delivers v. On queue-style packages (oneshot, spsc, spmc, mpsc,
-	// mpmc) Send blocks until the value is accepted by the channel or
-	// the channel is closed. On broadcast and watch Send never blocks —
-	// it publishes immediately and returns. Returns ErrClosed if the
-	// sender or hub has been closed.
+	// Send delivers v. On queue-style packages (spsc, spmc, mpsc, mpmc)
+	// Send blocks until the value is accepted by the channel or the
+	// channel is closed. On oneshot, broadcast, and watch Send never
+	// blocks — it publishes immediately and returns. Returns ErrClosed
+	// if the sender or hub has been closed.
 	Send(v T) error
 	// TrySend returns immediately without blocking. Returns nil on
 	// success, or one of: ErrFull (no room to enqueue), ErrClosed

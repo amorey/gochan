@@ -3,6 +3,8 @@
 /build/
 /dist/
 /coverage/
+/chan
+/recv
 *.test
 *.out
 *.exe

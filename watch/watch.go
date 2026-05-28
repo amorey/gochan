@@ -272,7 +272,9 @@ func (tx *Sender[T]) Close() {
 // fresh receiver, then blocks until the value changes again. If the
 // sender publishes multiple times between consecutive Recv calls,
 // only the most recent value is returned.
-func (rx *Receiver[T]) Recv() (T, error) { return rx.recvLoop(nil) }
+func (rx *Receiver[T]) Recv() (T, error) {
+	return rx.recvLoop(context.Background())
+}
 
 // RecvContext blocks like Recv but returns ctx.Err() if ctx is
 // cancelled first.
@@ -280,20 +282,18 @@ func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
 	return rx.recvLoop(ctx)
 }
 
-// recvLoop is the shared blocking-recv implementation. A nil ctx
-// degenerates into the non-cancellable Recv path (a nil channel in a
-// select arm is never selected). The pending-value check sits before
-// the receiver-closed check so that hub-close / sender-close can
-// drain the final value, while explicit receiver-close (via
-// [Receiver.Close]) short-circuits because rx.done is set inside
-// that path and the loop re-checks rx.done at the top of each
-// iteration before consulting state.
+// recvLoop is the shared blocking-recv implementation. Recv passes
+// context.Background() to opt out of cancellation — Background's
+// Done() returns nil, and a nil channel in a select arm is never
+// selected, so the cancellation arm is a no-op on that path. The
+// pending-value check sits before the receiver-closed check so that
+// hub-close / sender-close can drain the final value, while explicit
+// receiver-close (via [Receiver.Close]) short-circuits because
+// rx.done is set inside that path and the loop re-checks rx.done at
+// the top of each iteration before consulting state.
 func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 	var z T
-	var ctxDone <-chan struct{}
-	if ctx != nil {
-		ctxDone = ctx.Done()
-	}
+	ctxDone := ctx.Done()
 	parked := false
 	defer func() {
 		if parked {

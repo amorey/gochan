@@ -59,52 +59,25 @@ package mpsc
 
 import (
 	"context"
-	"sync"
-	"sync/atomic"
 
-	"github.com/amorey/gochan"
-	"github.com/amorey/gochan/internal/chancore"
+	"github.com/amorey/gochan/mpmc"
 )
-
-type shared[T any] struct {
-	ch chan T // the buffered channel; closed by the last Sender.Close or by Hub.Close
-	// chMu serializes concurrent ch <- v operations (held as a read lock)
-	// with close(ch) (held as a write lock). Holding RLock around the
-	// blocking select guarantees the closer cannot race close(s.ch) with a
-	// pending `s.ch <- v` arm — once dead is closed, the blocked sender
-	// wakes through that arm and releases the RLock before close(s.ch) runs.
-	chMu     sync.RWMutex
-	chClosed atomic.Bool
-
-	dead    chancore.CloseOnce
-	txReady chancore.CloseOnce // closed when the first Sender is registered
-
-	mu      sync.Mutex
-	txCount int // number of still-open senders
-
-	send chancore.BufferedSend[T]
-	recv chancore.BufferedRecv[T]
-}
 
 // Hub is the construction handle for an mpsc pipeline. Use [Hub.Sender]
 // to spawn one or more send-side handles and [Hub.Receiver] to obtain
 // the singleton receive-side handle. [Hub.Close] is equivalent to
 // calling Close on every live sender and on the receiver.
 type Hub[T any] struct {
-	s  *shared[T]
-	rx *Receiver[T] // the singleton receiver, returned by Hub.Receiver
+	h  *mpmc.Hub[T]
+	rx *Receiver[T] // singleton, eager-minted at construction
 }
 
 // Sender is a send-side handle of an mpsc pipeline. Obtain senders via
-// [Hub.Sender]. Each sender is owned by a single producer goroutine; the
-// closed flag is only touched by that owner so no atomic is required.
-type Sender[T any] struct {
-	s      *shared[T]
-	closed bool
-}
+// [Hub.Sender]. Each sender is owned by a single producer goroutine.
+type Sender[T any] struct{ tx *mpmc.Sender[T] }
 
 // Receiver is the singleton receive-side handle of an mpsc pipeline.
-type Receiver[T any] struct{ s *shared[T] }
+type Receiver[T any] struct{ rx *mpmc.Receiver[T] }
 
 // New creates a fresh mpsc Hub backed by a buffered Go channel of
 // the given capacity. capacity == 0 yields a rendezvous channel where
@@ -120,24 +93,8 @@ func New[T any](capacity int) *Hub[T] {
 	if capacity < 0 {
 		panic("mpsc: negative capacity")
 	}
-	s := &shared[T]{ch: make(chan T, capacity)}
-	s.dead.Init()
-	s.txReady.Init()
-	s.send = chancore.BufferedSend[T]{
-		Ch:        s.ch,
-		Dead:      s.dead.Done(),
-		ChClosed:  &s.chClosed,
-		SendLock:  s.chMu.RLocker(),
-		CloseLock: &s.chMu,
-	}
-	s.recv = chancore.BufferedRecv[T]{
-		Ch:    s.ch,
-		Dead:  s.dead.Done(),
-		Ready: &s.txReady,
-	}
-	h := &Hub[T]{s: s}
-	h.rx = &Receiver[T]{s: s}
-	return h
+	h := mpmc.New[T](capacity)
+	return &Hub[T]{h: h, rx: &Receiver[T]{rx: h.Receiver()}}
 }
 
 // Sender returns a new send-side handle bound to the shared queue. Use
@@ -148,17 +105,7 @@ func New[T any](capacity int) *Hub[T] {
 // previously-registered sender has already closed) or the receiver has
 // been closed, the returned handle is pre-closed and reports
 // [gochan.ErrClosed] on use.
-func (h *Hub[T]) Sender() *Sender[T] {
-	s := h.s
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.dead.IsClosed() || s.chClosed.Load() || (s.txReady.IsClosed() && s.txCount == 0) {
-		return &Sender[T]{s: s, closed: true}
-	}
-	s.txCount++
-	s.txReady.Close()
-	return &Sender[T]{s: s}
-}
+func (h *Hub[T]) Sender() *Sender[T] { return &Sender[T]{tx: h.h.Sender()} }
 
 // Receiver returns the singleton receive-side handle. Repeated calls
 // return the same handle. After the hub has been closed (explicitly via
@@ -174,40 +121,22 @@ func (h *Hub[T]) Receiver() *Receiver[T] { return h.rx }
 // drain them before seeing channel-closed. Idempotent. Inherits the
 // senders' close discipline — don't call concurrently with an active
 // Send on any sender from another goroutine.
-func (h *Hub[T]) Close() {
-	// Order matters: rx.Close raises dead so parked senders bail via the
-	// Dead arm and release chMu before CloseCh's writer Lock runs.
-	h.rx.Close()
-	h.s.send.CloseCh()
-}
+func (h *Hub[T]) Close() { h.h.Close() }
 
 // Send enqueues v, blocking while the buffer is full. Returns
 // [gochan.ErrClosed] if this sender has been closed, the receiver has
 // been closed, or the hub has been closed; on ErrClosed the value is
 // dropped.
-func (tx *Sender[T]) Send(v T) error {
-	if tx.closed {
-		return gochan.ErrClosed
-	}
-	return tx.s.send.Send(v)
-}
+func (tx *Sender[T]) Send(v T) error { return tx.tx.Send(v) }
 
 // TrySend is non-blocking. Returns [gochan.ErrFull] if the buffer is
 // full, [gochan.ErrClosed] if closed, or nil on success.
-func (tx *Sender[T]) TrySend(v T) error {
-	if tx.closed {
-		return gochan.ErrClosed
-	}
-	return tx.s.send.TrySend(v)
-}
+func (tx *Sender[T]) TrySend(v T) error { return tx.tx.TrySend(v) }
 
 // SendContext blocks like Send but returns ctx.Err() if ctx is
 // cancelled before the value is enqueued.
 func (tx *Sender[T]) SendContext(ctx context.Context, v T) error {
-	if tx.closed {
-		return gochan.ErrClosed
-	}
-	return tx.s.send.SendContext(ctx, v)
+	return tx.tx.SendContext(ctx, v)
 }
 
 // Close closes this sender only. Other senders continue to produce.
@@ -216,39 +145,25 @@ func (tx *Sender[T]) SendContext(ctx context.Context, v T) error {
 // draining) when every sender has been closed. Idempotent. Intended to
 // be called by the producer goroutine that owns this sender — mpsc does
 // not synchronize concurrent callers on the same sender handle.
-func (tx *Sender[T]) Close() {
-	if tx.closed {
-		return
-	}
-	tx.closed = true
-	s := tx.s
-	s.mu.Lock()
-	s.txCount--
-	last := s.txCount == 0
-	s.mu.Unlock()
-	if !last {
-		return
-	}
-	s.send.CloseCh()
-}
+func (tx *Sender[T]) Close() { tx.tx.Close() }
 
 // Recv blocks until a value is available. Returns the next value in
 // FIFO order, or [gochan.ErrClosed] if the buffer is empty and every
 // sender has closed, this receiver is closed, or the hub has been
 // closed.
-func (rx *Receiver[T]) Recv() (T, error) { return rx.s.recv.Recv() }
+func (rx *Receiver[T]) Recv() (T, error) { return rx.rx.Recv() }
 
 // TryRecv is non-blocking. Returns the next value if one is buffered,
 // [gochan.ErrNotReady] if no sender has yet been registered,
 // [gochan.ErrEmpty] if the buffer is empty but at least one sender is
 // still open, or [gochan.ErrClosed] if the buffer is empty and all
 // senders are closed (or this receiver/the hub is closed).
-func (rx *Receiver[T]) TryRecv() (T, error) { return rx.s.recv.TryRecv() }
+func (rx *Receiver[T]) TryRecv() (T, error) { return rx.rx.TryRecv() }
 
 // RecvContext blocks like Recv but returns ctx.Err() if ctx is
 // cancelled first. Cancellation does not close the receiver.
 func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
-	return rx.s.recv.RecvContext(ctx)
+	return rx.rx.RecvContext(ctx)
 }
 
 // Chan returns the underlying receive-only channel, suitable for use in
@@ -256,11 +171,11 @@ func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
 // drained (or when the hub is closed). Closing the receiver does not
 // close this channel — use Recv/TryRecv if you need that signal.
 // Repeated calls return the same channel.
-func (rx *Receiver[T]) Chan() <-chan T { return rx.s.ch }
+func (rx *Receiver[T]) Chan() <-chan T { return rx.rx.Chan() }
 
 // Close closes the receiver. Pending or future Send calls on any sender
 // return [gochan.ErrClosed], and subsequent Recv/TryRecv/RecvContext
 // calls return ErrClosed. Any values still buffered are abandoned for
 // Recv-style callers, but remain receivable via Chan until every sender
 // closes. Idempotent.
-func (rx *Receiver[T]) Close() { rx.s.dead.Close() }
+func (rx *Receiver[T]) Close() { rx.rx.Close() }

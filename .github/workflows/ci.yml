@@ -57,12 +57,28 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: 1.26
-      - name: Run coverage
-        run: go test -coverpkg=./... -coverprofile=cov.out ./...
+      - name: Run per-package coverage and merge
+        # `go test -coverpkg=X -coverprofile=Y ./...` writes only the last
+        # test binary's profile, so cross-package coverage gets lost. Run
+        # each package separately and union the profiles in `mode: set`.
+        run: |
+          set -euo pipefail
+          PKGS=$(go list ./... | grep -v /examples/)
+          ALL=$(echo "$PKGS" | paste -sd, -)
+          mkdir -p cov
+          for pkg in $PKGS; do
+            name=$(echo "$pkg" | sed 's|/|_|g')
+            go test -coverpkg="$ALL" -coverprofile="cov/${name}.out" "$pkg" 2>&1 \
+              | grep -v "no packages being tested depend on" || true
+          done
+          echo "mode: set" > cov.out
+          cat cov/*.out | grep -v "^mode:" | \
+            awk '{ if ($3=="1") seen[$1" "$2]=1; else if (!($1" "$2 in seen)) seen[$1" "$2]=0 } END { for (k in seen) print k, seen[k] }' \
+            >> cov.out
+          go tool cover -func=cov.out | tail -1
       - name: Enforce 100% coverage on library packages
         run: |
           set -euo pipefail
-          go tool cover -func=cov.out | tail -1
           uncovered=$(go tool cover -func=cov.out | awk '$3 != "100.0%" && $3 != "" && $1 !~ /examples/ && $1 !~ /^total:/')
           if [ -n "$uncovered" ]; then
             echo "Coverage below 100% on library packages:"

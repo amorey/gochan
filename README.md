@@ -5,6 +5,7 @@
 <img width="435" alt="gochan" src="https://github.com/user-attachments/assets/55534faa-494e-4038-a093-6c37f7040693" />
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/amorey/gochan.svg)](https://pkg.go.dev/github.com/amorey/gochan)
+![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)
 
 ## Introduction
 

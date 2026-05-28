@@ -159,6 +159,8 @@ func TestSenderCloseIdempotent(t *testing.T) {
 	tx.Close()
 	assert.NotPanics(t, func() { tx.Close() })
 	assert.ErrorIs(t, tx.Send(1), gochan.ErrClosed)
+	assert.ErrorIs(t, tx.TrySend(1), gochan.ErrClosed)
+	assert.ErrorIs(t, tx.SendContext(context.Background(), 1), gochan.ErrClosed)
 }
 
 func TestReceiverCloseIdempotent(t *testing.T) {

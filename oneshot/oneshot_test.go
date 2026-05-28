@@ -251,6 +251,51 @@ func TestChanIsStable(t *testing.T) {
 	assert.True(t, c == rx.Chan(), "Chan() returned different channels on repeated calls")
 }
 
+func TestTrySend(t *testing.T) {
+	tx, rx := newPair[int](t)
+	require.NoError(t, tx.TrySend(7))
+	v, err := rx.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, 7, v)
+	assert.ErrorIs(t, tx.TrySend(8), gochan.ErrClosed)
+}
+
+// TestChanLateRegistrationAfterSend covers Chan's late-registration branch
+// where a value is already in the slot: the new userCh receives the value
+// inline and is then closed.
+func TestChanLateRegistrationAfterSend(t *testing.T) {
+	tx, rx := newPair[int](t)
+	require.NoError(t, tx.Send(42))
+	c := rx.Chan()
+	v, ok := <-c
+	require.True(t, ok)
+	assert.Equal(t, 42, v)
+	_, ok = <-c
+	assert.False(t, ok)
+}
+
+// TestChanLateRegistrationAfterSenderClose covers Chan's late-registration
+// branch where the pair is terminal but no value is available: the new
+// userCh closes empty.
+func TestChanLateRegistrationAfterSenderClose(t *testing.T) {
+	tx, rx := newPair[int](t)
+	tx.Close()
+	c := rx.Chan()
+	_, ok := <-c
+	assert.False(t, ok)
+}
+
+// TestReceiverCloseClosesUserCh covers the Receiver.Close path where userCh
+// exists (registered via Chan) and the pair was not yet terminal — Close
+// must close userCh.
+func TestReceiverCloseClosesUserCh(t *testing.T) {
+	_, rx := newPair[int](t)
+	c := rx.Chan()
+	rx.Close()
+	_, ok := <-c
+	assert.False(t, ok)
+}
+
 func TestChanClosedOnSenderClose(t *testing.T) {
 	tx, rx := newPair[int](t)
 	c := rx.Chan()

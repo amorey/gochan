@@ -3,6 +3,7 @@ package watch_test
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -788,4 +789,162 @@ func TestEachReceiverIndependentLastSeen(t *testing.T) {
 	v, err := b.Recv()
 	require.NoError(t, err)
 	assert.Equal(t, 1, v)
+}
+
+// TestRecvSelectWakesOnReceiverClose covers recvLoop's <-rx.done.Done()
+// select arm for both Recv and RecvContext — the receiver is parked in
+// the select when Close fires.
+func TestRecvSelectWakesOnReceiverClose(t *testing.T) {
+	ops := []struct {
+		name string
+		call func(*watch.Receiver[int]) error
+	}{
+		{"Recv", func(rx *watch.Receiver[int]) error { _, err := rx.Recv(); return err }},
+		{"RecvContext", func(rx *watch.Receiver[int]) error { _, err := rx.RecvContext(context.Background()); return err }},
+	}
+	for _, op := range ops {
+		t.Run(op.name, func(t *testing.T) {
+			for i := 0; i < 50; i++ {
+				h := newHub[int](t, 0)
+				_ = newTx(t, h)
+				rx := newRx(t, h)
+				// Consume the initial value so the next call blocks.
+				_, err := rx.Recv()
+				require.NoError(t, err)
+				var wg sync.WaitGroup
+				wg.Add(1)
+				done := make(chan error, 1)
+				go func() {
+					wg.Done()
+					done <- op.call(rx)
+				}()
+				wg.Wait()
+				runtime.Gosched()
+				rx.Close()
+				assert.ErrorIs(t, <-done, gochan.ErrClosed)
+			}
+		})
+	}
+}
+
+// TestChanFeederBailsOnReceiverClose covers feed's <-rx.done.Done() arm in
+// the send-to-rx.ch select. The feeder is parked on `rx.ch <- v` (consumer
+// not reading); Close fires done, unblocking the feeder via the done arm.
+// Uses the SetFeederParkedHook to synchronize deterministically.
+func TestChanFeederBailsOnReceiverClose(t *testing.T) {
+	h := newHub[int](t, 0)
+	rx := newRx(t, h)
+	tx := newTx(t, h)
+	parked := make(chan struct{}, 4)
+	rx.SetFeederParkedHook(func() {
+		select {
+		case parked <- struct{}{}:
+		default:
+		}
+	})
+	ch := rx.Chan()
+	<-parked // feeder parked trying to deliver the initial value
+	// Publish a new value to keep the feeder busy on the send arm.
+	require.NoError(t, tx.Send(99))
+	<-parked
+	rx.Close()
+	// Drain ch — feeder bails via rx.done.Done() and defer closes ch.
+	timeout := time.After(time.Second)
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				return
+			}
+		case <-timeout:
+			t.Fatal("feeder did not close ch after Receiver.Close")
+		}
+	}
+}
+
+// TestRecvCloseRace hits recvLoop / TryRecv / feed re-check-under-mu
+// branches by racing Receiver.Close against an active receiver across many
+// iterations. Each iteration uses an independent receiver per consumer to
+// respect watch's single-consumer-per-receiver contract. These are TOCTOU
+// re-checks (rx.done flips between the lock-free check and acquiring mu);
+// deterministic coverage isn't possible — high iteration count + Gosched
+// makes the race likely enough to hit.
+func TestRecvCloseRace(t *testing.T) {
+	consumers := []struct {
+		name string
+		run  func(rx *watch.Receiver[int]) <-chan struct{}
+	}{
+		{"Recv", func(rx *watch.Receiver[int]) <-chan struct{} {
+			done := make(chan struct{})
+			go func() {
+				for {
+					if _, err := rx.Recv(); err != nil {
+						close(done)
+						return
+					}
+				}
+			}()
+			return done
+		}},
+		{"TryRecv", func(rx *watch.Receiver[int]) <-chan struct{} {
+			done := make(chan struct{})
+			go func() {
+				for {
+					if _, err := rx.TryRecv(); errors.Is(err, gochan.ErrClosed) {
+						close(done)
+						return
+					}
+					// Yield so the closer/producer make progress under
+					// GOMAXPROCS=1. The fast-path TryRecv doesn't park,
+					// so without this the loop monopolizes the P.
+					runtime.Gosched()
+				}
+			}()
+			return done
+		}},
+		{"Chan", func(rx *watch.Receiver[int]) <-chan struct{} {
+			done := make(chan struct{})
+			go func() {
+				for range rx.Chan() {
+				}
+				close(done)
+			}()
+			return done
+		}},
+	}
+	for _, c := range consumers {
+		t.Run(c.name, func(t *testing.T) {
+			for i := 0; i < 200; i++ {
+				h := newHub[int](t, 0)
+				tx := newTx(t, h)
+				rx := newRx(t, h)
+				stop := make(chan struct{})
+				prodDone := make(chan struct{})
+				go func() {
+					defer close(prodDone)
+					for n := 0; ; n++ {
+						select {
+						case <-stop:
+							return
+						default:
+							_ = tx.Send(n)
+							// Yield so the closer/consumer make progress
+							// under GOMAXPROCS=1. watch.Send never blocks,
+							// so without this the loop monopolizes the P.
+							runtime.Gosched()
+						}
+					}
+				}()
+				done := c.run(rx)
+				runtime.Gosched()
+				rx.Close()
+				<-done
+				close(stop)
+				// Wait for the producer before the next iteration —
+				// otherwise the 200-iter × 3 subtests loop accumulates
+				// runnable Send goroutines under GOMAXPROCS=1.
+				<-prodDone
+			}
+		})
+	}
 }

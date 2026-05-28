@@ -422,7 +422,9 @@ func (tx *Sender[T]) Close() {
 //   - [gochan.ErrClosed] — the sender or hub has closed and this
 //     receiver has already drained everything still in the ring at or
 //     after its position.
-func (rx *Receiver[T]) Recv() (T, error) { return rx.recvLoop(nil) }
+func (rx *Receiver[T]) Recv() (T, error) {
+	return rx.recvLoop(context.Background())
+}
 
 // RecvContext blocks like [Receiver.Recv] but returns ctx.Err() if ctx
 // is cancelled first. A ready value or [gochan.ErrLagged] is preferred
@@ -432,9 +434,10 @@ func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
 }
 
 // recvLoop blocks until a value is available, the receiver/sender is
-// closed, or (when ctx != nil) ctx is cancelled. A nil channel in a
-// select arm is never selected, so a nil ctx degenerates into the
-// non-cancellable Recv path.
+// closed, or ctx is cancelled. Recv passes context.Background() to opt
+// out of cancellation — Background's Done() returns nil, and a nil
+// channel in a select arm is never selected, so the cancellation arm
+// is a no-op on that path.
 //
 // `parked` carries across iterations so the waiters++ done before
 // sleeping is matched by a waiters-- on the next iteration's lock,
@@ -442,10 +445,7 @@ func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
 // drop through the defer to release the same accounting.
 func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 	var z T
-	var ctxDone <-chan struct{}
-	if ctx != nil {
-		ctxDone = ctx.Done()
-	}
+	ctxDone := ctx.Done()
 	parked := false
 	defer func() {
 		if parked {

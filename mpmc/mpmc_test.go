@@ -2,6 +2,7 @@ package mpmc_test
 
 import (
 	"context"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -231,6 +232,112 @@ func TestSenderCloseIdempotent(t *testing.T) {
 	tx.Close()
 	assert.NotPanics(t, func() { tx.Close() })
 	assert.ErrorIs(t, tx.Send(1), gochan.ErrClosed)
+	assert.ErrorIs(t, tx.TrySend(1), gochan.ErrClosed)
+	assert.ErrorIs(t, tx.SendContext(context.Background(), 1), gochan.ErrClosed)
+}
+
+// TestRecvContextValueArrivesDuringWait covers RecvContext's second-select
+// "case v, ok := <-s.ch" arm with a real value — value is sent after the
+// non-blocking probe missed, while the receiver is parked in the second
+// select.
+func TestRecvContextValueArrivesDuringWait(t *testing.T) {
+	h := newHub[int](t, 1)
+	tx := newTx(t, h)
+	rx := newRx(t, h)
+	type result struct {
+		v   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		v, err := rx.RecvContext(context.Background())
+		done <- result{v, err}
+	}()
+	runtime.Gosched()
+	require.NoError(t, tx.Send(42))
+	r := <-done
+	require.NoError(t, r.err)
+	assert.Equal(t, 42, r.v)
+}
+
+// recvOp names a blocking recv-style method on a *mpmc.Receiver.
+type recvOp struct {
+	name string
+	call func(*mpmc.Receiver[int]) error
+}
+
+var recvOps = []recvOp{
+	{"Recv", func(rx *mpmc.Receiver[int]) error { _, err := rx.Recv(); return err }},
+	{"RecvContext", func(rx *mpmc.Receiver[int]) error { _, err := rx.RecvContext(context.Background()); return err }},
+}
+
+// runParkedRecvHubCloseRace spawns the recv op, ensures it has started
+// (WaitGroup) and then yields (Gosched) so the goroutine reaches the
+// select before Hub.Close fires. Loops to overcome scheduler bias.
+func runParkedRecvHubCloseRace(t *testing.T, op recvOp) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		h := newHub[int](t, 0)
+		_ = newTx(t, h)
+		rx := newRx(t, h)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		done := make(chan error, 1)
+		go func() {
+			wg.Done()
+			done <- op.call(rx)
+		}()
+		wg.Wait()
+		runtime.Gosched()
+		h.Close()
+		assert.ErrorIs(t, <-done, gochan.ErrClosed)
+	}
+}
+
+// TestRecvSelectWakesOnHubClose covers the <-s.dead.Done() select arm of
+// both Recv and RecvContext — the receiver is parked when the hub fires
+// dead.
+func TestRecvSelectWakesOnHubClose(t *testing.T) {
+	for _, op := range recvOps {
+		t.Run(op.name, func(t *testing.T) { runParkedRecvHubCloseRace(t, op) })
+	}
+}
+
+// TestRecvContextProbeSeesChannelClosed covers RecvContext's first
+// (non-blocking) select arm "case v, ok := <-s.ch" with !ok — the channel
+// is already closed (all senders closed) before RecvContext runs.
+func TestRecvContextProbeSeesChannelClosed(t *testing.T) {
+	h := newHub[int](t, 1)
+	tx := newTx(t, h)
+	rx := newRx(t, h)
+	tx.Close() // last sender close → s.ch closed
+	_, err := rx.RecvContext(context.Background())
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+}
+
+// TestRecvContextSelectWakesOnSendersClosed covers RecvContext's
+// second-select "case v, ok := <-s.ch" with !ok — last sender closes the
+// channel while the receiver is parked, dead is not fired. Standalone
+// rather than parameterized because the trigger needs the sender handle
+// returned by newTx.
+func TestRecvContextSelectWakesOnSendersClosed(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		h := newHub[int](t, 0)
+		tx := newTx(t, h)
+		rx := newRx(t, h)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		done := make(chan error, 1)
+		go func() {
+			wg.Done()
+			_, err := rx.RecvContext(context.Background())
+			done <- err
+		}()
+		wg.Wait()
+		runtime.Gosched()
+		tx.Close() // last sender → closes s.ch, does not fire dead
+		assert.ErrorIs(t, <-done, gochan.ErrClosed)
+	}
 }
 
 func TestReceiverCloseIdempotent(t *testing.T) {

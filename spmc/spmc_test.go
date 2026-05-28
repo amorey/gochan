@@ -2,6 +2,7 @@ package spmc_test
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -609,6 +610,119 @@ func TestCloseBlockedReceiverPreservesBufferedOrder(t *testing.T) {
 		}
 		require.Lenf(t, seen, n, "iter %d: missing values, got %v / %v", i, got1, got2)
 	}
+}
+
+// recvOp names a blocking recv-style method on a *spmc.Receiver.
+type recvOp struct {
+	name string
+	call func(*spmc.Receiver[int]) error
+}
+
+var recvOps = []recvOp{
+	{"Recv", func(rx *spmc.Receiver[int]) error { _, err := rx.Recv(); return err }},
+	{"RecvContext", func(rx *spmc.Receiver[int]) error { _, err := rx.RecvContext(context.Background()); return err }},
+}
+
+// runParkedRecvCloseRace spawns the recv op, ensures it has started
+// (WaitGroup) and then yields (Gosched) so the goroutine reaches the
+// select before trigger fires. Loops to overcome scheduler bias —
+// without the loop a fast main-goroutine close would routinely catch
+// the entry-guard rather than the parked select.
+func runParkedRecvCloseRace(t *testing.T, op recvOp, trigger func(*spmc.Hub[int], *spmc.Receiver[int])) {
+	t.Helper()
+	for i := 0; i < 50; i++ {
+		h, _ := newHubTx[int](t, 0)
+		rx := newRx(t, h)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		done := make(chan error, 1)
+		go func() {
+			wg.Done()
+			done <- op.call(rx)
+		}()
+		wg.Wait()
+		runtime.Gosched()
+		trigger(h, rx)
+		assert.ErrorIs(t, <-done, gochan.ErrClosed)
+	}
+}
+
+// TestRecvSelectWakesOnReceiverClose covers the <-rx.done.Done() select
+// arm of both Recv and RecvContext.
+func TestRecvSelectWakesOnReceiverClose(t *testing.T) {
+	for _, op := range recvOps {
+		t.Run(op.name, func(t *testing.T) {
+			runParkedRecvCloseRace(t, op, func(_ *spmc.Hub[int], rx *spmc.Receiver[int]) { rx.Close() })
+		})
+	}
+}
+
+// TestRecvSelectWakesOnHubClose covers the <-s.dead.Done() select arm of
+// both Recv and RecvContext.
+func TestRecvSelectWakesOnHubClose(t *testing.T) {
+	for _, op := range recvOps {
+		t.Run(op.name, func(t *testing.T) {
+			runParkedRecvCloseRace(t, op, func(h *spmc.Hub[int], _ *spmc.Receiver[int]) { h.Close() })
+		})
+	}
+}
+
+// TestRecvContextProbeSeesChannelClosed covers RecvContext's first
+// (non-blocking) select arm "case v, ok := <-s.ch" with !ok — sender closed
+// the channel before RecvContext was called, dead is still open.
+func TestRecvContextProbeSeesChannelClosed(t *testing.T) {
+	h, tx := newHubTx[int](t, 1)
+	rx := newRx(t, h)
+	tx.Close()
+	_, err := rx.RecvContext(context.Background())
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+}
+
+// TestRecvContextSelectWakesOnSenderClose covers RecvContext's second
+// (blocking) select arm "case v, ok := <-s.ch" with !ok — sender closes the
+// channel while RecvContext is parked, dead is not fired. Uses a fresh
+// hub per iteration with sender-close as the trigger; can't share
+// runParkedRecvCloseRace because that helper exposes only (hub, rx) to
+// the trigger callback.
+func TestRecvContextSelectWakesOnSenderClose(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		h, tx := newHubTx[int](t, 0)
+		rx := newRx(t, h)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		done := make(chan error, 1)
+		go func() {
+			wg.Done()
+			_, err := rx.RecvContext(context.Background())
+			done <- err
+		}()
+		wg.Wait()
+		runtime.Gosched()
+		tx.Close()
+		assert.ErrorIs(t, <-done, gochan.ErrClosed)
+	}
+}
+
+// TestRecvContextValueArrivesDuringWait covers RecvContext's second-select
+// "case v, ok := <-s.ch" arm — value arrives after the non-blocking probe
+// missed, while the receiver is parked in the second select.
+func TestRecvContextValueArrivesDuringWait(t *testing.T) {
+	h, tx := newHubTx[int](t, 1)
+	rx := newRx(t, h)
+	type result struct {
+		v   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		v, err := rx.RecvContext(context.Background())
+		done <- result{v, err}
+	}()
+	runtime.Gosched()
+	require.NoError(t, tx.Send(42))
+	r := <-done
+	require.NoError(t, r.err)
+	assert.Equal(t, 42, r.v)
 }
 
 func TestHubCloseAllowsChanDrain(t *testing.T) {

@@ -3,6 +3,7 @@ package broadcast_test
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -594,5 +595,168 @@ func TestConcurrentReceiversAllSeeEveryValue(t *testing.T) {
 
 	for i, c := range counts {
 		assert.Equal(t, int64(items), c, "rx %d", i)
+	}
+}
+
+// TestSendContextSucceedsWhenCtxLive covers the SendContext non-cancelled
+// path: ctx.Err() is nil, fall through to tx.Send.
+func TestSendContextSucceedsWhenCtxLive(t *testing.T) {
+	h := newHub[int](t, 2)
+	rx := newRx(t, h)
+	tx := newTx(t, h)
+	require.NoError(t, tx.SendContext(context.Background(), 99))
+	v, err := rx.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, 99, v)
+}
+
+// TestSenderCloseIdempotent covers Sender.Close's "already closed" early
+// return.
+func TestSenderCloseIdempotent(t *testing.T) {
+	h := newHub[int](t, 2)
+	tx := newTx(t, h)
+	tx.Close()
+	assert.NotPanics(t, func() { tx.Close() })
+}
+
+// TestReceiverCloseIdempotent covers unregisterLocked's done-already-closed
+// early return.
+func TestReceiverCloseIdempotent(t *testing.T) {
+	h := newHub[int](t, 2)
+	rx := newRx(t, h)
+	rx.Close()
+	assert.NotPanics(t, func() { rx.Close() })
+}
+
+// TestRecomputeMinWithEqualPositions covers recomputeMinLocked's
+// "rx.pos == newMin" branch. recompute only fires from TrySend when
+// writePos has reached capacity (eviction-check path). Setup: cap=2
+// hub, two receivers, fill the ring, both advance to the same position,
+// then TrySend triggers recompute which walks the receiver set and
+// finds them tied.
+func TestRecomputeMinWithEqualPositions(t *testing.T) {
+	h := newHub[int](t, 2)
+	rx1 := newRx(t, h)
+	rx2 := newRx(t, h)
+	tx := newTx(t, h)
+	require.NoError(t, tx.Send(1))
+	require.NoError(t, tx.Send(2)) // writePos now == capacity
+	// Both advance from pos=0 → pos=1. The second advance drops minCount
+	// to 0 and sets minStale; rx1 and rx2 are now both at pos=1.
+	_, err := rx1.TryRecv()
+	require.NoError(t, err)
+	_, err = rx2.TryRecv()
+	require.NoError(t, err)
+	// TrySend with wp >= capacity + minStale triggers recomputeMinLocked,
+	// which iterates the receiver set and hits the equal-min branch on
+	// the second receiver.
+	require.NoError(t, tx.TrySend(3))
+}
+
+// TestChanFeederBailsOnReceiverClose covers the feeder's
+// "<-rx.done.Done()" arm in its send-to-rx.ch select. With no consumer
+// reading from Chan(), the feeder parks on "rx.ch <- v" after Recv
+// returns a value; Close fires done, unblocking it.
+func TestChanFeederBailsOnReceiverClose(t *testing.T) {
+	h := newHub[int](t, 4)
+	rx := newRx(t, h)
+	tx := newTx(t, h)
+	ch := rx.Chan()
+	require.NoError(t, tx.Send(1)) // feeder picks up, parks on `rx.ch <- v`
+	runtime.Gosched()
+	rx.Close()
+	// Drain whatever the feeder managed to enqueue, expect close.
+	timeout := time.After(time.Second)
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				return
+			}
+		case <-timeout:
+			t.Fatal("feeder did not close ch after Receiver.Close")
+		}
+	}
+}
+
+// TestRecvCloseRace hits the recvLoop / TryRecv re-check-under-mu branches
+// by racing Receiver.Close against Recv / TryRecv across many iterations.
+// Each subtest uses an independent receiver per consumer to respect
+// broadcast's single-consumer-per-receiver contract. The re-checks are
+// TOCTOU (done flips between the lock-free check and the mu acquisition),
+// so deterministic coverage isn't possible.
+func TestRecvCloseRace(t *testing.T) {
+	consumers := []struct {
+		name string
+		run  func(rx *broadcast.Receiver[int]) <-chan struct{}
+	}{
+		{"Recv", func(rx *broadcast.Receiver[int]) <-chan struct{} {
+			done := make(chan struct{})
+			go func() {
+				_, _ = rx.Recv()
+				close(done)
+			}()
+			return done
+		}},
+		{"TryRecv", func(rx *broadcast.Receiver[int]) <-chan struct{} {
+			done := make(chan struct{})
+			go func() {
+				_, _ = rx.TryRecv()
+				close(done)
+			}()
+			return done
+		}},
+	}
+	for _, c := range consumers {
+		t.Run(c.name, func(t *testing.T) {
+			for i := 0; i < 1000; i++ {
+				h := newHub[int](t, 1)
+				tx := newTx(t, h)
+				// Multiple receivers, each used by exactly one goroutine,
+				// widen the race surface for the TOCTOU re-check.
+				const N = 8
+				stop := make(chan struct{})
+				prodDone := make(chan struct{})
+				go func() {
+					defer close(prodDone)
+					for {
+						select {
+						case <-stop:
+							return
+						default:
+							_ = tx.TrySend(1)
+							// Yield so consumers/closer make progress
+							// under GOMAXPROCS=1. Without this, the
+							// non-blocking TrySend monopolizes the P.
+							runtime.Gosched()
+						}
+					}
+				}()
+				rxs := make([]*broadcast.Receiver[int], N)
+				dones := make([]<-chan struct{}, N)
+				for j := 0; j < N; j++ {
+					rxs[j] = newRx(t, h)
+					dones[j] = c.run(rxs[j])
+				}
+				// Close from a separate goroutine so we don't serialize
+				// with the consumer goroutines starting.
+				closeDone := make(chan struct{})
+				go func() {
+					for _, rx := range rxs {
+						rx.Close()
+					}
+					close(closeDone)
+				}()
+				for _, d := range dones {
+					<-d
+				}
+				<-closeDone
+				close(stop)
+				// Wait for the producer to exit before the next iteration
+				// — otherwise the 1000-iter loop accumulates runnable
+				// TrySend goroutines that starve everything else.
+				<-prodDone
+			}
+		})
 	}
 }

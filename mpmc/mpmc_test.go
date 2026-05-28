@@ -140,6 +140,24 @@ func TestTryRecvGates(t *testing.T) {
 	assert.ErrorIs(t, err, gochan.ErrClosed)
 }
 
+func TestTryRecvAfterReceiverClose(t *testing.T) {
+	h := newHub[int](t, 1)
+	_ = newTx(t, h)
+	rx := newRx(t, h)
+	rx.Close()
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+}
+
+func TestTryRecvAfterHubClose(t *testing.T) {
+	h := newHub[int](t, 1)
+	_ = newTx(t, h)
+	rx := newRx(t, h)
+	h.Close()
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+}
+
 func TestSendContextCancel(t *testing.T) {
 	h := newHub[int](t, 1)
 	tx := newTx(t, h)

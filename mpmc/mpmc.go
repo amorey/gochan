@@ -271,12 +271,8 @@ func (tx *Sender[T]) Close() {
 func (rx *Receiver[T]) Recv() (T, error) {
 	var z T
 	s := rx.s
-	select {
-	case <-rx.done.Done():
+	if rx.done.IsClosed() || s.dead.IsClosed() {
 		return z, gochan.ErrClosed
-	case <-s.dead.Done():
-		return z, gochan.ErrClosed
-	default:
 	}
 	select {
 	case <-rx.done.Done():
@@ -299,12 +295,8 @@ func (rx *Receiver[T]) Recv() (T, error) {
 func (rx *Receiver[T]) TryRecv() (T, error) {
 	var z T
 	s := rx.s
-	select {
-	case <-rx.done.Done():
+	if rx.done.IsClosed() || s.dead.IsClosed() {
 		return z, gochan.ErrClosed
-	case <-s.dead.Done():
-		return z, gochan.ErrClosed
-	default:
 	}
 	select {
 	case v, ok := <-s.ch:
@@ -325,12 +317,8 @@ func (rx *Receiver[T]) TryRecv() (T, error) {
 func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
 	var z T
 	s := rx.s
-	select {
-	case <-rx.done.Done():
+	if rx.done.IsClosed() || s.dead.IsClosed() {
 		return z, gochan.ErrClosed
-	case <-s.dead.Done():
-		return z, gochan.ErrClosed
-	default:
 	}
 	select {
 	case v, ok := <-s.ch:

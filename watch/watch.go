@@ -151,6 +151,13 @@ type Receiver[T any] struct {
 	// Send between the snapshot and the delivery; it is nil in
 	// production builds.
 	testFeederParked func()
+
+	// testBeforeRecvLock and testBeforeTryRecvLock, if non-nil, are
+	// invoked after the lock-free closed/version checks and before
+	// taking s.mu. Tests use them to deterministically exercise the
+	// receiver-close re-checks under s.mu.
+	testBeforeRecvLock    func()
+	testBeforeTryRecvLock func()
 }
 
 // New creates a watch Hub seeded with initial as the current value.
@@ -306,6 +313,9 @@ func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 		if rx.done.IsClosed() {
 			return z, gochan.ErrClosed
 		}
+		if rx.testBeforeRecvLock != nil {
+			rx.testBeforeRecvLock()
+		}
 		rx.s.mu.Lock()
 		if parked {
 			rx.s.waiters--
@@ -366,6 +376,9 @@ func (rx *Receiver[T]) TryRecv() (T, error) {
 			return z, gochan.ErrClosed
 		}
 		return z, gochan.ErrEmpty
+	}
+	if rx.testBeforeTryRecvLock != nil {
+		rx.testBeforeTryRecvLock()
 	}
 	// Slow path: version moved past lastSeen on the fast-path load,
 	// and version is monotonic, so val is guaranteed pending. Take

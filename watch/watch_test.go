@@ -514,6 +514,28 @@ func TestReceiverCloseRacingPendingValue(t *testing.T) {
 	}
 }
 
+func TestRecvReceiverCloseBetweenPrecheckAndLock(t *testing.T) {
+	h := newHub[int](t, 0)
+	rx := newRx(t, h)
+	rx.SetBeforeRecvLockHook(func() {
+		rx.Close()
+	})
+
+	_, err := rx.Recv()
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+}
+
+func TestTryRecvReceiverCloseBetweenPrecheckAndLock(t *testing.T) {
+	h := newHub[int](t, 0)
+	rx := newRx(t, h)
+	rx.SetBeforeTryRecvLockHook(func() {
+		rx.Close()
+	})
+
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+}
+
 func TestSenderCloseWakesBlockedRecv(t *testing.T) {
 	h := newHub[int](t, 0)
 	rx := newRx(t, h)
@@ -862,13 +884,11 @@ func TestChanFeederBailsOnReceiverClose(t *testing.T) {
 	}
 }
 
-// TestRecvCloseRace hits recvLoop / TryRecv / feed re-check-under-mu
-// branches by racing Receiver.Close against an active receiver across many
-// iterations. Each iteration uses an independent receiver per consumer to
-// respect watch's single-consumer-per-receiver contract. These are TOCTOU
-// re-checks (rx.done flips between the lock-free check and acquiring mu);
-// deterministic coverage isn't possible — high iteration count + Gosched
-// makes the race likely enough to hit.
+// TestRecvCloseRace stresses receiver-close races across recvLoop, TryRecv,
+// and feed. Focused hook-based tests above cover the recvLoop/TryRecv
+// re-check branches deterministically; this loop keeps pressure on the
+// concurrent behavior with independent receivers per consumer to respect
+// watch's single-consumer-per-receiver contract.
 func TestRecvCloseRace(t *testing.T) {
 	consumers := []struct {
 		name string

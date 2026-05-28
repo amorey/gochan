@@ -6,6 +6,15 @@ package watch
 // build-time access to unexported fields.
 func (rx *Receiver[T]) SetFeederParkedHook(fn func()) { rx.testFeederParked = fn }
 
+// SetBeforeRecvLockHook installs a test-only callback invoked by Recv and
+// RecvContext after their lock-free closed check and before acquiring the
+// shared mutex.
+func (rx *Receiver[T]) SetBeforeRecvLockHook(fn func()) { rx.testBeforeRecvLock = fn }
+
+// SetBeforeTryRecvLockHook installs a test-only callback invoked by TryRecv
+// after it observes a pending value and before acquiring the shared mutex.
+func (rx *Receiver[T]) SetBeforeTryRecvLockHook(fn func()) { rx.testBeforeTryRecvLock = fn }
+
 // ReceiverCount returns the number of receivers currently registered
 // with the hub. Exposed for tests that verify deregistration on
 // terminal ErrClosed.

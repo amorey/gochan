@@ -81,7 +81,7 @@ jobs:
           mkdir -p cov
           for pkg in $PKGS; do
             name=$(echo "$pkg" | sed 's|/|_|g')
-            go test -coverpkg="$ALL" -coverprofile="cov/${name}.out" "$pkg" 2>&1 \
+            go test -count=1 -coverpkg="$ALL" -coverprofile="cov/${name}.out" "$pkg" 2>&1 \
               | grep -v "no packages being tested depend on" || true
           done
           echo "mode: set" > cov.out

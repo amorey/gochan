@@ -145,19 +145,19 @@ type Receiver[T any] struct {
 	chOnce sync.Once
 	ch     chan T
 
-	// testFeederParked, if non-nil, is invoked by the Chan feeder
+	// forTestingFeederParked, if non-nil, is invoked by the Chan feeder
 	// goroutine each time it snapshots a value and enters the send
 	// select. Tests use it to deterministically interleave a second
 	// Send between the snapshot and the delivery; it is nil in
 	// production builds.
-	testFeederParked func()
+	forTestingFeederParked func()
 
-	// testBeforeRecvLock and testBeforeTryRecvLock, if non-nil, are
-	// invoked after the lock-free closed/version checks and before
-	// taking s.mu. Tests use them to deterministically exercise the
-	// receiver-close re-checks under s.mu.
-	testBeforeRecvLock    func()
-	testBeforeTryRecvLock func()
+	// forTestingBeforeRecvLock and forTestingBeforeTryRecvLock, if
+	// non-nil, are invoked after the lock-free closed/version checks
+	// and before taking s.mu. Tests use them to deterministically
+	// exercise the receiver-close re-checks under s.mu.
+	forTestingBeforeRecvLock    func()
+	forTestingBeforeTryRecvLock func()
 }
 
 // New creates a watch Hub seeded with initial as the current value.
@@ -313,8 +313,8 @@ func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 		if rx.done.IsClosed() {
 			return z, gochan.ErrClosed
 		}
-		if rx.testBeforeRecvLock != nil {
-			rx.testBeforeRecvLock()
+		if rx.forTestingBeforeRecvLock != nil {
+			rx.forTestingBeforeRecvLock()
 		}
 		rx.s.mu.Lock()
 		if parked {
@@ -377,8 +377,8 @@ func (rx *Receiver[T]) TryRecv() (T, error) {
 		}
 		return z, gochan.ErrEmpty
 	}
-	if rx.testBeforeTryRecvLock != nil {
-		rx.testBeforeTryRecvLock()
+	if rx.forTestingBeforeTryRecvLock != nil {
+		rx.forTestingBeforeTryRecvLock()
 	}
 	// Slow path: version moved past lastSeen on the fast-path load,
 	// and version is monotonic, so val is guaranteed pending. Take
@@ -452,8 +452,8 @@ func (rx *Receiver[T]) feed() {
 			s.waiters++
 			parked = true
 			s.mu.Unlock()
-			if rx.testFeederParked != nil {
-				rx.testFeederParked()
+			if rx.forTestingFeederParked != nil {
+				rx.forTestingFeederParked()
 			}
 			select {
 			case rx.ch <- v:

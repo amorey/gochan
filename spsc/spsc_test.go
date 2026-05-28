@@ -1,4 +1,4 @@
-package spsc_test
+package spsc
 
 import (
 	"context"
@@ -10,12 +10,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/amorey/gochan"
-	"github.com/amorey/gochan/spsc"
 )
 
-func newPair[T any](t *testing.T, capacity int) (tx *spsc.Sender[T], rx *spsc.Receiver[T]) {
+func newPair[T any](t *testing.T, capacity int) (tx *Sender[T], rx *Receiver[T]) {
 	t.Helper()
-	return spsc.New[T](capacity)
+	return New[T](capacity)
 }
 
 func TestImplementsCommonInterfaces(t *testing.T) {
@@ -25,7 +24,7 @@ func TestImplementsCommonInterfaces(t *testing.T) {
 }
 
 func TestNegativeCapacityPanics(t *testing.T) {
-	assert.Panics(t, func() { spsc.New[int](-1) })
+	assert.Panics(t, func() { New[int](-1) })
 }
 
 func TestSendRecvFIFO(t *testing.T) {
@@ -257,7 +256,7 @@ func TestReceiverCloseUnblocksRecv(t *testing.T) {
 // scheduling orders.
 func TestReceiverCloseRaceWithBlockedSender(t *testing.T) {
 	for i := 0; i < 2000; i++ {
-		tx, rx := spsc.New[int](1)
+		tx, rx := New[int](1)
 		require.NoError(t, tx.Send(1)) // fill buffer; next Send must block
 		errCh := make(chan error, 1)
 		go func() { errCh <- tx.Send(2) }()
@@ -273,7 +272,7 @@ func TestSenderCloseAllowsChanDrain(t *testing.T) {
 	// can still drain anything in flight via Chan() before the channel
 	// closes. (rx.Close, by contrast, abandons buffered values for
 	// Recv-style callers.)
-	tx, rx := spsc.New[int](4)
+	tx, rx := New[int](4)
 	require.NoError(t, tx.Send(1))
 	require.NoError(t, tx.Send(2))
 	ch := rx.Chan()

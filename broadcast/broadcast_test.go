@@ -1,4 +1,4 @@
-package broadcast_test
+package broadcast
 
 import (
 	"context"
@@ -13,20 +13,19 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/amorey/gochan"
-	"github.com/amorey/gochan/broadcast"
 )
 
-func newHub[T any](t *testing.T, capacity int) *broadcast.Hub[T] {
+func newHub[T any](t *testing.T, capacity int) *Hub[T] {
 	t.Helper()
-	return broadcast.New[T](capacity)
+	return New[T](capacity)
 }
 
-func newTx[T any](t *testing.T, h *broadcast.Hub[T]) *broadcast.Sender[T] {
+func newTx[T any](t *testing.T, h *Hub[T]) *Sender[T] {
 	t.Helper()
 	return h.Sender()
 }
 
-func newRx[T any](t *testing.T, h *broadcast.Hub[T]) *broadcast.Receiver[T] {
+func newRx[T any](t *testing.T, h *Hub[T]) *Receiver[T] {
 	t.Helper()
 	return h.Receiver()
 }
@@ -40,8 +39,8 @@ func TestImplementsCommonInterfaces(t *testing.T) {
 }
 
 func TestZeroOrNegativeCapacityPanics(t *testing.T) {
-	assert.Panics(t, func() { broadcast.New[int](0) })
-	assert.Panics(t, func() { broadcast.New[int](-1) })
+	assert.Panics(t, func() { New[int](0) })
+	assert.Panics(t, func() { New[int](-1) })
 }
 
 func TestSenderSingleton(t *testing.T) {
@@ -53,7 +52,7 @@ func TestFanOutDeliversToEveryReceiver(t *testing.T) {
 	const items = 50
 	const nrx = 4
 	h := newHub[int](t, 64)
-	rxs := make([]*broadcast.Receiver[int], nrx)
+	rxs := make([]*Receiver[int], nrx)
 	for i := range rxs {
 		rxs[i] = newRx(t, h)
 	}
@@ -563,7 +562,7 @@ func TestConcurrentReceiversAllSeeEveryValue(t *testing.T) {
 	const nrx = 8
 	const items = 200
 	h := newHub[int](t, 256)
-	rxs := make([]*broadcast.Receiver[int], nrx)
+	rxs := make([]*Receiver[int], nrx)
 	for i := range rxs {
 		rxs[i] = newRx(t, h)
 	}
@@ -688,9 +687,9 @@ func TestChanFeederBailsOnReceiverClose(t *testing.T) {
 func TestRecvCloseRace(t *testing.T) {
 	consumers := []struct {
 		name string
-		run  func(rx *broadcast.Receiver[int]) <-chan struct{}
+		run  func(rx *Receiver[int]) <-chan struct{}
 	}{
-		{"Recv", func(rx *broadcast.Receiver[int]) <-chan struct{} {
+		{"Recv", func(rx *Receiver[int]) <-chan struct{} {
 			done := make(chan struct{})
 			go func() {
 				_, _ = rx.Recv()
@@ -698,7 +697,7 @@ func TestRecvCloseRace(t *testing.T) {
 			}()
 			return done
 		}},
-		{"TryRecv", func(rx *broadcast.Receiver[int]) <-chan struct{} {
+		{"TryRecv", func(rx *Receiver[int]) <-chan struct{} {
 			done := make(chan struct{})
 			go func() {
 				_, _ = rx.TryRecv()
@@ -732,7 +731,7 @@ func TestRecvCloseRace(t *testing.T) {
 						}
 					}
 				}()
-				rxs := make([]*broadcast.Receiver[int], N)
+				rxs := make([]*Receiver[int], N)
 				dones := make([]<-chan struct{}, N)
 				for j := 0; j < N; j++ {
 					rxs[j] = newRx(t, h)

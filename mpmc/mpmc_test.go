@@ -302,6 +302,33 @@ func TestRecvSelectWakesOnHubClose(t *testing.T) {
 	}
 }
 
+// TestRecvSelectWakesOnReceiverClose covers the <-rx.done.Done() select
+// arm of both Recv and RecvContext — the receiver is parked when its own
+// Close fires. Other tests close the receiver before calling Recv, so they
+// hit the lock-free IsClosed fast path and never enter the select.
+func TestRecvSelectWakesOnReceiverClose(t *testing.T) {
+	for _, op := range recvOps {
+		t.Run(op.name, func(t *testing.T) {
+			for i := 0; i < 200; i++ {
+				h := newHub[int](t, 0)
+				_ = newTx(t, h)
+				rx := newRx(t, h)
+				var wg sync.WaitGroup
+				wg.Add(1)
+				done := make(chan error, 1)
+				go func() {
+					wg.Done()
+					done <- op.call(rx)
+				}()
+				wg.Wait()
+				runtime.Gosched()
+				rx.Close()
+				assert.ErrorIs(t, <-done, gochan.ErrClosed)
+			}
+		})
+	}
+}
+
 // TestRecvContextProbeSeesChannelClosed covers RecvContext's first
 // (non-blocking) select arm "case v, ok := <-s.ch" with !ok — the channel
 // is already closed (all senders closed) before RecvContext runs.

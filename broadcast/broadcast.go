@@ -196,7 +196,7 @@ func (s *shared[T]) signalLocked() {
 // recomputeMinLocked walks the receiver set to refresh minPos /
 // minCount. Caller must hold s.mu and len(s.receivers) > 0.
 func (s *shared[T]) recomputeMinLocked() {
-	var newMin uint64 = ^uint64(0)
+	newMin := ^uint64(0)
 	var newCount int
 	for rx := range s.receivers {
 		if rx.pos < newMin {

@@ -226,7 +226,7 @@ func TestRecvContextPrefersValueOverCancel(t *testing.T) {
 
 func TestReceiverCloseAfterSendDropsValue(t *testing.T) {
 	// rx.Close after a successful Send must drop the pending value (per spec).
-	type big struct{ payload [1024]byte }
+	type big struct{ _ [1024]byte }
 	tx, rx := newPair[*big](t)
 	require.NoError(t, tx.Send(&big{}))
 	rx.Close()

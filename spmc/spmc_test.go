@@ -1,4 +1,4 @@
-package spmc_test
+package spmc
 
 import (
 	"context"
@@ -12,16 +12,15 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/amorey/gochan"
-	"github.com/amorey/gochan/spmc"
 )
 
-func newHubTx[T any](t *testing.T, capacity int) (*spmc.Hub[T], *spmc.Sender[T]) {
+func newHubTx[T any](t *testing.T, capacity int) (*Hub[T], *Sender[T]) {
 	t.Helper()
-	h := spmc.New[T](capacity)
+	h := New[T](capacity)
 	return h, h.Sender()
 }
 
-func newRx[T any](t *testing.T, h *spmc.Hub[T]) *spmc.Receiver[T] {
+func newRx[T any](t *testing.T, h *Hub[T]) *Receiver[T] {
 	t.Helper()
 	return h.Receiver()
 }
@@ -34,7 +33,7 @@ func TestImplementsCommonInterfaces(t *testing.T) {
 }
 
 func TestNegativeCapacityPanics(t *testing.T) {
-	assert.Panics(t, func() { spmc.New[int](-1) })
+	assert.Panics(t, func() { New[int](-1) })
 }
 
 func TestSendRecvSingleReceiver(t *testing.T) {
@@ -251,7 +250,7 @@ func TestConsumerSharesQueue(t *testing.T) {
 	require.NoError(t, tx.Send(2))
 	require.NoError(t, tx.Send(3))
 
-	collect := func(rx *spmc.Receiver[int]) int {
+	collect := func(rx *Receiver[int]) int {
 		v, err := rx.Recv()
 		require.NoError(t, err)
 		return v
@@ -282,7 +281,7 @@ func TestWorkDistribution(t *testing.T) {
 	wg.Add(workers)
 	for i := 0; i < workers; i++ {
 		w := newRx(t, h)
-		go func(w *spmc.Receiver[int]) {
+		go func(w *Receiver[int]) {
 			defer wg.Done()
 			defer w.Close()
 			for {
@@ -335,12 +334,12 @@ func TestRecvReturnsClosedAfterReceiverClose(t *testing.T) {
 }
 
 func TestSenderIsIdempotent(t *testing.T) {
-	h := spmc.New[int](1)
+	h := New[int](1)
 	assert.Same(t, h.Sender(), h.Sender())
 }
 
 func TestSenderReceiverAfterHubCloseAreClosed(t *testing.T) {
-	h := spmc.New[int](1)
+	h := New[int](1)
 	h.Close()
 	tx := h.Sender()
 	assert.ErrorIs(t, tx.Send(1), gochan.ErrClosed)
@@ -392,7 +391,7 @@ func TestHubCloseUnblocksReceivers(t *testing.T) {
 }
 
 func TestHubCloseIdempotent(t *testing.T) {
-	h := spmc.New[int](1)
+	h := New[int](1)
 	assert.NotPanics(t, func() {
 		h.Close()
 		h.Close()
@@ -612,15 +611,15 @@ func TestCloseBlockedReceiverPreservesBufferedOrder(t *testing.T) {
 	}
 }
 
-// recvOp names a blocking recv-style method on a *spmc.Receiver.
+// recvOp names a blocking recv-style method on a *Receiver.
 type recvOp struct {
 	name string
-	call func(*spmc.Receiver[int]) error
+	call func(*Receiver[int]) error
 }
 
 var recvOps = []recvOp{
-	{"Recv", func(rx *spmc.Receiver[int]) error { _, err := rx.Recv(); return err }},
-	{"RecvContext", func(rx *spmc.Receiver[int]) error { _, err := rx.RecvContext(context.Background()); return err }},
+	{"Recv", func(rx *Receiver[int]) error { _, err := rx.Recv(); return err }},
+	{"RecvContext", func(rx *Receiver[int]) error { _, err := rx.RecvContext(context.Background()); return err }},
 }
 
 // runParkedRecvCloseRace spawns the recv op, ensures it has started
@@ -628,7 +627,7 @@ var recvOps = []recvOp{
 // select before trigger fires. Loops to overcome scheduler bias —
 // without the loop a fast main-goroutine close would routinely catch
 // the entry-guard rather than the parked select.
-func runParkedRecvCloseRace(t *testing.T, op recvOp, trigger func(*spmc.Hub[int], *spmc.Receiver[int])) {
+func runParkedRecvCloseRace(t *testing.T, op recvOp, trigger func(*Hub[int], *Receiver[int])) {
 	t.Helper()
 	for i := 0; i < 50; i++ {
 		h, _ := newHubTx[int](t, 0)
@@ -652,7 +651,7 @@ func runParkedRecvCloseRace(t *testing.T, op recvOp, trigger func(*spmc.Hub[int]
 func TestRecvSelectWakesOnReceiverClose(t *testing.T) {
 	for _, op := range recvOps {
 		t.Run(op.name, func(t *testing.T) {
-			runParkedRecvCloseRace(t, op, func(_ *spmc.Hub[int], rx *spmc.Receiver[int]) { rx.Close() })
+			runParkedRecvCloseRace(t, op, func(_ *Hub[int], rx *Receiver[int]) { rx.Close() })
 		})
 	}
 }
@@ -662,7 +661,7 @@ func TestRecvSelectWakesOnReceiverClose(t *testing.T) {
 func TestRecvSelectWakesOnHubClose(t *testing.T) {
 	for _, op := range recvOps {
 		t.Run(op.name, func(t *testing.T) {
-			runParkedRecvCloseRace(t, op, func(h *spmc.Hub[int], _ *spmc.Receiver[int]) { h.Close() })
+			runParkedRecvCloseRace(t, op, func(h *Hub[int], _ *Receiver[int]) { h.Close() })
 		})
 	}
 }

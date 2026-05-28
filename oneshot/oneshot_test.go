@@ -1,4 +1,4 @@
-package oneshot_test
+package oneshot
 
 import (
 	"context"
@@ -10,12 +10,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/amorey/gochan"
-	"github.com/amorey/gochan/oneshot"
 )
 
-func newPair[T any](t *testing.T) (tx *oneshot.Sender[T], rx *oneshot.Receiver[T]) {
+func newPair[T any](t *testing.T) (tx *Sender[T], rx *Receiver[T]) {
 	t.Helper()
-	return oneshot.New[T]()
+	return New[T]()
 }
 
 func TestImplementsCommonInterfaces(t *testing.T) {
@@ -226,7 +225,7 @@ func TestRecvContextPrefersValueOverCancel(t *testing.T) {
 
 func TestReceiverCloseAfterSendDropsValue(t *testing.T) {
 	// rx.Close after a successful Send must drop the pending value (per spec).
-	type big struct{ payload [1024]byte }
+	type big struct{ _ [1024]byte }
 	tx, rx := newPair[*big](t)
 	require.NoError(t, tx.Send(&big{}))
 	rx.Close()

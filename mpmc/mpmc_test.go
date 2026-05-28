@@ -1,4 +1,4 @@
-package mpmc_test
+package mpmc
 
 import (
 	"context"
@@ -13,20 +13,19 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/amorey/gochan"
-	"github.com/amorey/gochan/mpmc"
 )
 
-func newHub[T any](t *testing.T, capacity int) *mpmc.Hub[T] {
+func newHub[T any](t *testing.T, capacity int) *Hub[T] {
 	t.Helper()
-	return mpmc.New[T](capacity)
+	return New[T](capacity)
 }
 
-func newTx[T any](t *testing.T, h *mpmc.Hub[T]) *mpmc.Sender[T] {
+func newTx[T any](t *testing.T, h *Hub[T]) *Sender[T] {
 	t.Helper()
 	return h.Sender()
 }
 
-func newRx[T any](t *testing.T, h *mpmc.Hub[T]) *mpmc.Receiver[T] {
+func newRx[T any](t *testing.T, h *Hub[T]) *Receiver[T] {
 	t.Helper()
 	return h.Receiver()
 }
@@ -40,7 +39,7 @@ func TestImplementsCommonInterfaces(t *testing.T) {
 }
 
 func TestNegativeCapacityPanics(t *testing.T) {
-	assert.Panics(t, func() { mpmc.New[int](-1) })
+	assert.Panics(t, func() { New[int](-1) })
 }
 
 func TestSendRecvFIFO(t *testing.T) {
@@ -260,15 +259,15 @@ func TestRecvContextValueArrivesDuringWait(t *testing.T) {
 	assert.Equal(t, 42, r.v)
 }
 
-// recvOp names a blocking recv-style method on a *mpmc.Receiver.
+// recvOp names a blocking recv-style method on a *Receiver.
 type recvOp struct {
 	name string
-	call func(*mpmc.Receiver[int]) error
+	call func(*Receiver[int]) error
 }
 
 var recvOps = []recvOp{
-	{"Recv", func(rx *mpmc.Receiver[int]) error { _, err := rx.Recv(); return err }},
-	{"RecvContext", func(rx *mpmc.Receiver[int]) error { _, err := rx.RecvContext(context.Background()); return err }},
+	{"Recv", func(rx *Receiver[int]) error { _, err := rx.Recv(); return err }},
+	{"RecvContext", func(rx *Receiver[int]) error { _, err := rx.RecvContext(context.Background()); return err }},
 }
 
 // runParkedRecvHubCloseRace spawns the recv op, ensures it has started
@@ -300,6 +299,33 @@ func runParkedRecvHubCloseRace(t *testing.T, op recvOp) {
 func TestRecvSelectWakesOnHubClose(t *testing.T) {
 	for _, op := range recvOps {
 		t.Run(op.name, func(t *testing.T) { runParkedRecvHubCloseRace(t, op) })
+	}
+}
+
+// TestRecvSelectWakesOnReceiverClose covers the <-rx.done.Done() select
+// arm of both Recv and RecvContext — the receiver is parked when its own
+// Close fires. Other tests close the receiver before calling Recv, so they
+// hit the lock-free IsClosed fast path and never enter the select.
+func TestRecvSelectWakesOnReceiverClose(t *testing.T) {
+	for _, op := range recvOps {
+		t.Run(op.name, func(t *testing.T) {
+			for i := 0; i < 200; i++ {
+				h := newHub[int](t, 0)
+				_ = newTx(t, h)
+				rx := newRx(t, h)
+				var wg sync.WaitGroup
+				wg.Add(1)
+				done := make(chan error, 1)
+				go func() {
+					wg.Done()
+					done <- op.call(rx)
+				}()
+				wg.Wait()
+				runtime.Gosched()
+				rx.Close()
+				assert.ErrorIs(t, <-done, gochan.ErrClosed)
+			}
+		})
 	}
 }
 
@@ -445,7 +471,7 @@ func TestReceiverAfterAllReceiversClosedIsPreClosed(t *testing.T) {
 }
 
 func TestSenderReceiverAfterHubCloseAreClosed(t *testing.T) {
-	h := mpmc.New[int](1)
+	h := New[int](1)
 	h.Close()
 	tx := h.Sender()
 	assert.ErrorIs(t, tx.Send(1), gochan.ErrClosed)
@@ -516,7 +542,7 @@ func TestHubCloseUnblocksReceivers(t *testing.T) {
 }
 
 func TestHubCloseIdempotent(t *testing.T) {
-	h := mpmc.New[int](1)
+	h := New[int](1)
 	assert.NotPanics(t, func() {
 		h.Close()
 		h.Close()

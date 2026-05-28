@@ -1,4 +1,4 @@
-package mpsc_test
+package mpsc
 
 import (
 	"context"
@@ -12,16 +12,15 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/amorey/gochan"
-	"github.com/amorey/gochan/mpsc"
 )
 
-func newHubRx[T any](t *testing.T, capacity int) (*mpsc.Hub[T], *mpsc.Receiver[T]) {
+func newHubRx[T any](t *testing.T, capacity int) (*Hub[T], *Receiver[T]) {
 	t.Helper()
-	h := mpsc.New[T](capacity)
+	h := New[T](capacity)
 	return h, h.Receiver()
 }
 
-func newTx[T any](t *testing.T, h *mpsc.Hub[T]) *mpsc.Sender[T] {
+func newTx[T any](t *testing.T, h *Hub[T]) *Sender[T] {
 	t.Helper()
 	return h.Sender()
 }
@@ -34,7 +33,7 @@ func TestImplementsCommonInterfaces(t *testing.T) {
 }
 
 func TestNegativeCapacityPanics(t *testing.T) {
-	assert.Panics(t, func() { mpsc.New[int](-1) })
+	assert.Panics(t, func() { New[int](-1) })
 }
 
 func TestSendRecvSingleSender(t *testing.T) {
@@ -297,12 +296,12 @@ func TestSenderAfterAllClosedIsPreClosed(t *testing.T) {
 }
 
 func TestReceiverIsIdempotent(t *testing.T) {
-	h := mpsc.New[int](1)
+	h := New[int](1)
 	assert.Same(t, h.Receiver(), h.Receiver())
 }
 
 func TestSenderReceiverAfterHubCloseAreClosed(t *testing.T) {
-	h := mpsc.New[int](1)
+	h := New[int](1)
 	h.Close()
 	tx := h.Sender()
 	assert.ErrorIs(t, tx.Send(1), gochan.ErrClosed)
@@ -350,7 +349,7 @@ func TestHubCloseUnblocksReceiver(t *testing.T) {
 }
 
 func TestHubCloseIdempotent(t *testing.T) {
-	h := mpsc.New[int](1)
+	h := New[int](1)
 	assert.NotPanics(t, func() {
 		h.Close()
 		h.Close()

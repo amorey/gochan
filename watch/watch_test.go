@@ -1,4 +1,4 @@
-package watch_test
+package watch
 
 import (
 	"context"
@@ -13,20 +13,19 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/amorey/gochan"
-	"github.com/amorey/gochan/watch"
 )
 
-func newHub[T any](t *testing.T, initial T) *watch.Hub[T] {
+func newHub[T any](t *testing.T, initial T) *Hub[T] {
 	t.Helper()
-	return watch.New[T](initial)
+	return New[T](initial)
 }
 
-func newTx[T any](t *testing.T, h *watch.Hub[T]) *watch.Sender[T] {
+func newTx[T any](t *testing.T, h *Hub[T]) *Sender[T] {
 	t.Helper()
 	return h.Sender()
 }
 
-func newRx[T any](t *testing.T, h *watch.Hub[T]) *watch.Receiver[T] {
+func newRx[T any](t *testing.T, h *Hub[T]) *Receiver[T] {
 	t.Helper()
 	return h.Receiver()
 }
@@ -338,7 +337,7 @@ func TestSoftCloseDoesNotLeakReceivers(t *testing.T) {
 		_, err = rx.Recv() // terminal ErrClosed → deregister
 		require.ErrorIs(t, err, gochan.ErrClosed)
 	}
-	assert.Equal(t, 0, h.ReceiverCount(), "receivers should deregister on terminal ErrClosed")
+	assert.Equal(t, 0, h.forTestingReceiverCount(), "receivers should deregister on terminal ErrClosed")
 }
 
 func TestSoftCloseTryRecvDeregisters(t *testing.T) {
@@ -351,7 +350,7 @@ func TestSoftCloseTryRecvDeregisters(t *testing.T) {
 
 	_, err = rx.TryRecv()
 	require.ErrorIs(t, err, gochan.ErrClosed)
-	assert.Equal(t, 0, h.ReceiverCount())
+	assert.Equal(t, 0, h.forTestingReceiverCount())
 }
 
 func TestSoftCloseFeedDeregisters(t *testing.T) {
@@ -373,7 +372,7 @@ func TestSoftCloseFeedDeregisters(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Chan not closed after sender close")
 	}
-	assert.Equal(t, 0, h.ReceiverCount())
+	assert.Equal(t, 0, h.forTestingReceiverCount())
 }
 
 func TestSenderCloseStillDeliversFinalValueAfterHubChange(t *testing.T) {
@@ -512,6 +511,28 @@ func TestReceiverCloseRacingPendingValue(t *testing.T) {
 		_, err := rx.Recv()
 		require.ErrorIs(t, err, gochan.ErrClosed)
 	}
+}
+
+func TestRecvReceiverCloseBetweenPrecheckAndLock(t *testing.T) {
+	h := newHub[int](t, 0)
+	rx := newRx(t, h)
+	rx.forTestingBeforeRecvLock = func() {
+		rx.Close()
+	}
+
+	_, err := rx.Recv()
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+}
+
+func TestTryRecvReceiverCloseBetweenPrecheckAndLock(t *testing.T) {
+	h := newHub[int](t, 0)
+	rx := newRx(t, h)
+	rx.forTestingBeforeTryRecvLock = func() {
+		rx.Close()
+	}
+
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gochan.ErrClosed)
 }
 
 func TestSenderCloseWakesBlockedRecv(t *testing.T) {
@@ -660,12 +681,12 @@ func TestChanCoalescesWhileConsumerSlow(t *testing.T) {
 	tx := newTx(t, h)
 
 	parked := make(chan struct{}, 8)
-	rx.SetFeederParkedHook(func() {
+	rx.forTestingFeederParked = func() {
 		select {
 		case parked <- struct{}{}:
 		default:
 		}
-	})
+	}
 	ch := rx.Chan()
 
 	// Drain initial; feeder will park on send then loop and park on
@@ -737,7 +758,7 @@ func TestConcurrentReceivers(t *testing.T) {
 	h := newHub[int](t, 0)
 	tx := newTx(t, h)
 
-	rxs := make([]*watch.Receiver[int], readers)
+	rxs := make([]*Receiver[int], readers)
 	for i := range rxs {
 		rxs[i] = newRx(t, h)
 	}
@@ -797,10 +818,10 @@ func TestEachReceiverIndependentLastSeen(t *testing.T) {
 func TestRecvSelectWakesOnReceiverClose(t *testing.T) {
 	ops := []struct {
 		name string
-		call func(*watch.Receiver[int]) error
+		call func(*Receiver[int]) error
 	}{
-		{"Recv", func(rx *watch.Receiver[int]) error { _, err := rx.Recv(); return err }},
-		{"RecvContext", func(rx *watch.Receiver[int]) error { _, err := rx.RecvContext(context.Background()); return err }},
+		{"Recv", func(rx *Receiver[int]) error { _, err := rx.Recv(); return err }},
+		{"RecvContext", func(rx *Receiver[int]) error { _, err := rx.RecvContext(context.Background()); return err }},
 	}
 	for _, op := range ops {
 		t.Run(op.name, func(t *testing.T) {
@@ -830,18 +851,18 @@ func TestRecvSelectWakesOnReceiverClose(t *testing.T) {
 // TestChanFeederBailsOnReceiverClose covers feed's <-rx.done.Done() arm in
 // the send-to-rx.ch select. The feeder is parked on `rx.ch <- v` (consumer
 // not reading); Close fires done, unblocking the feeder via the done arm.
-// Uses the SetFeederParkedHook to synchronize deterministically.
+// Uses the forTestingFeederParked to synchronize deterministically.
 func TestChanFeederBailsOnReceiverClose(t *testing.T) {
 	h := newHub[int](t, 0)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 	parked := make(chan struct{}, 4)
-	rx.SetFeederParkedHook(func() {
+	rx.forTestingFeederParked = func() {
 		select {
 		case parked <- struct{}{}:
 		default:
 		}
-	})
+	}
 	ch := rx.Chan()
 	<-parked // feeder parked trying to deliver the initial value
 	// Publish a new value to keep the feeder busy on the send arm.
@@ -862,19 +883,17 @@ func TestChanFeederBailsOnReceiverClose(t *testing.T) {
 	}
 }
 
-// TestRecvCloseRace hits recvLoop / TryRecv / feed re-check-under-mu
-// branches by racing Receiver.Close against an active receiver across many
-// iterations. Each iteration uses an independent receiver per consumer to
-// respect watch's single-consumer-per-receiver contract. These are TOCTOU
-// re-checks (rx.done flips between the lock-free check and acquiring mu);
-// deterministic coverage isn't possible — high iteration count + Gosched
-// makes the race likely enough to hit.
+// TestRecvCloseRace stresses receiver-close races across recvLoop, TryRecv,
+// and feed. Focused hook-based tests above cover the recvLoop/TryRecv
+// re-check branches deterministically; this loop keeps pressure on the
+// concurrent behavior with independent receivers per consumer to respect
+// watch's single-consumer-per-receiver contract.
 func TestRecvCloseRace(t *testing.T) {
 	consumers := []struct {
 		name string
-		run  func(rx *watch.Receiver[int]) <-chan struct{}
+		run  func(rx *Receiver[int]) <-chan struct{}
 	}{
-		{"Recv", func(rx *watch.Receiver[int]) <-chan struct{} {
+		{"Recv", func(rx *Receiver[int]) <-chan struct{} {
 			done := make(chan struct{})
 			go func() {
 				for {
@@ -886,7 +905,7 @@ func TestRecvCloseRace(t *testing.T) {
 			}()
 			return done
 		}},
-		{"TryRecv", func(rx *watch.Receiver[int]) <-chan struct{} {
+		{"TryRecv", func(rx *Receiver[int]) <-chan struct{} {
 			done := make(chan struct{})
 			go func() {
 				for {
@@ -902,7 +921,7 @@ func TestRecvCloseRace(t *testing.T) {
 			}()
 			return done
 		}},
-		{"Chan", func(rx *watch.Receiver[int]) <-chan struct{} {
+		{"Chan", func(rx *Receiver[int]) <-chan struct{} {
 			done := make(chan struct{})
 			go func() {
 				for range rx.Chan() {

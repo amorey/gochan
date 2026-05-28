@@ -1,6 +1,6 @@
 # gochan
 
-*A small library that implements multiple channel architectures for Go, inspired by Rust*
+*Gochan is a small library of common channel architectures for Go, inspired by Rust*
 
 <img width="435" alt="gochan" src="https://github.com/user-attachments/assets/55534faa-494e-4038-a093-6c37f7040693" />
 
@@ -20,6 +20,8 @@ Go channels are extremely useful but they only ship with one type - mpmc (multip
 | `mpmc`      | many    | many      | General load-balanced queue.                               |
 | `broadcast` | 1       | many      | Fan-out: every item delivered to *every* active receiver.  |
 | `watch`     | 1       | many      | Latest-value-only, new sends overwrite unread ones.        |
+
+With these types you can add common coordination patterns to your Go structs without writing custom code yourself.
 
 ## Installation
 

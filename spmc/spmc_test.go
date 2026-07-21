@@ -2,7 +2,6 @@ package spmc
 
 import (
 	"context"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/amorey/gochan"
+	"github.com/amorey/gochan/internal/parked"
 )
 
 func newHubTx[T any](t *testing.T, capacity int) (*Hub[T], *Sender[T]) {
@@ -125,13 +125,19 @@ func TestRecvContextCancel(t *testing.T) {
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
-func TestRecvContextPrefersValueOverCancel(t *testing.T) {
+// TestRecvContextCancelBeatsBufferedValue mirrors mpmc's test of the same
+// name: a cancelled ctx outranks a buffered value, and the value stays in
+// the queue.
+func TestRecvContextCancelBeatsBufferedValue(t *testing.T) {
 	h, tx := newHubTx[int](t, 1)
 	rx := newRx(t, h)
 	require.NoError(t, tx.Send(5))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	v, err := rx.RecvContext(ctx)
+	_, err := rx.RecvContext(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+
+	v, err := rx.TryRecv()
 	require.NoError(t, err)
 	assert.Equal(t, 5, v)
 }
@@ -622,28 +628,27 @@ var recvOps = []recvOp{
 	{"RecvContext", func(rx *Receiver[int]) error { _, err := rx.RecvContext(context.Background()); return err }},
 }
 
-// runParkedRecvCloseRace spawns the recv op, ensures it has started
-// (WaitGroup) and then yields (Gosched) so the goroutine reaches the
-// select before trigger fires. Loops to overcome scheduler bias —
-// without the loop a fast main-goroutine close would routinely catch
-// the entry-guard rather than the parked select.
+// runParkedRecvCloseRace spawns the recv op, waits until it has genuinely
+// parked in the select, and only then fires the trigger.
+//
+// A WaitGroup signalled before the call cannot establish that: it proves
+// only that the goroutine was scheduled, so a trigger landing first would
+// be answered by the entry-guard and the test would pass having covered
+// the fast path rather than the parked select it names.
+//
+// spmc's Recv delegates to the embedded mpmc receiver, so the parked
+// goroutine carries the spmc frame as the caller — matching on it still
+// means "an spmc Recv is parked".
 func runParkedRecvCloseRace(t *testing.T, op recvOp, trigger func(*Hub[int], *Receiver[int])) {
 	t.Helper()
-	for i := 0; i < 50; i++ {
-		h, _ := newHubTx[int](t, 0)
-		rx := newRx(t, h)
-		var wg sync.WaitGroup
-		wg.Add(1)
-		done := make(chan error, 1)
-		go func() {
-			wg.Done()
-			done <- op.call(rx)
-		}()
-		wg.Wait()
-		runtime.Gosched()
-		trigger(h, rx)
-		assert.ErrorIs(t, <-done, gochan.ErrClosed)
-	}
+	h, _ := newHubTx[int](t, 0)
+	rx := newRx(t, h)
+	done := make(chan error, 1)
+	base := parked.Snapshot(parked.InSelect, "spmc.(*Receiver[...])."+op.name+"(")
+	go func() { done <- op.call(rx) }()
+	base.Wait(t, 1)
+	trigger(h, rx)
+	assert.ErrorIs(t, <-done, gochan.ErrClosed)
 }
 
 // TestRecvSelectWakesOnReceiverClose covers the <-rx.done.Done() select
@@ -684,22 +689,17 @@ func TestRecvContextProbeSeesChannelClosed(t *testing.T) {
 // runParkedRecvCloseRace because that helper exposes only (hub, rx) to
 // the trigger callback.
 func TestRecvContextSelectWakesOnSenderClose(t *testing.T) {
-	for i := 0; i < 50; i++ {
-		h, tx := newHubTx[int](t, 0)
-		rx := newRx(t, h)
-		var wg sync.WaitGroup
-		wg.Add(1)
-		done := make(chan error, 1)
-		go func() {
-			wg.Done()
-			_, err := rx.RecvContext(context.Background())
-			done <- err
-		}()
-		wg.Wait()
-		runtime.Gosched()
-		tx.Close()
-		assert.ErrorIs(t, <-done, gochan.ErrClosed)
-	}
+	h, tx := newHubTx[int](t, 0)
+	rx := newRx(t, h)
+	done := make(chan error, 1)
+	base := parked.Snapshot(parked.InSelect, "spmc.(*Receiver[...]).RecvContext(")
+	go func() {
+		_, err := rx.RecvContext(context.Background())
+		done <- err
+	}()
+	base.Wait(t, 1)
+	tx.Close()
+	assert.ErrorIs(t, <-done, gochan.ErrClosed)
 }
 
 // TestRecvContextValueArrivesDuringWait covers RecvContext's second-select
@@ -713,11 +713,12 @@ func TestRecvContextValueArrivesDuringWait(t *testing.T) {
 		err error
 	}
 	done := make(chan result, 1)
+	base := parked.Snapshot(parked.InSelect, "spmc.(*Receiver[...]).RecvContext(")
 	go func() {
 		v, err := rx.RecvContext(context.Background())
 		done <- result{v, err}
 	}()
-	runtime.Gosched()
+	base.Wait(t, 1) // probe has missed; committed to the select
 	require.NoError(t, tx.Send(42))
 	r := <-done
 	require.NoError(t, r.err)

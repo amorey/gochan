@@ -383,10 +383,22 @@ func (tx *Sender[T]) TrySend(v T) error {
 	return nil
 }
 
-// SendContext returns ctx.Err() if ctx is already cancelled; otherwise
-// behaves like Send. Send never blocks, so there is nothing for
+// SendContext behaves like Send, but reports an already-cancelled ctx
+// instead of publishing. Send never blocks, so there is nothing for
 // cancellation to interrupt mid-call.
+//
+// Precedence is closed > cancelled: a sender already closed on entry
+// reports [gochan.ErrClosed] even for an already-cancelled ctx, since
+// that is the durable answer and a retry with a fresh context would only
+// return it again. A cancelled ctx on a live sender still reports
+// ctx.Err(). Pinned by the root package's conformance table.
 func (tx *Sender[T]) SendContext(ctx context.Context, v T) error {
+	// txClosed is the same atomic Send tests under mu, so this entry
+	// check is exact. A close landing between here and Send is reported
+	// by Send's own check, so nothing is lost by not holding mu.
+	if tx.s.txClosed.Load() {
+		return gochan.ErrClosed
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -427,8 +439,27 @@ func (rx *Receiver[T]) Recv() (T, error) {
 }
 
 // RecvContext blocks like [Receiver.Recv] but returns ctx.Err() if ctx
-// is cancelled first. A ready value or [gochan.ErrLagged] is preferred
-// over a cancelled context.
+// is cancelled first. Cancellation does not close this receiver.
+//
+// Precedence is closed > cancelled > value: a termination already
+// visible on entry outranks a cancelled ctx, and a cancelled ctx
+// outranks both a ready value and a pending [gochan.ErrLagged]. The
+// latter is what keeps cancellation observable under load — otherwise a
+// receiver looping on RecvContext against a sender fast enough to keep a
+// value always ready would never see its own shutdown signal. No value
+// is discarded: the receiver's position is untouched, so the next Recv
+// resumes where this call would have.
+//
+// Because nothing is discarded, ctx.Err() is not an end-of-stream: with
+// the sender closed and values still ahead of this receiver, every
+// RecvContext on a cancelled ctx reports ctx.Err() and none of them
+// reaches [gochan.ErrClosed]. Only draining to ErrClosed deregisters a
+// receiver on its own, so a caller that stops on ctx.Err() must
+// [Receiver.Close] — otherwise the handle stays in the hub, holding its
+// ring slot and its place in the eviction cohort for the hub's lifetime.
+// `defer rx.Close()` covers this, as it does for any abandoned receiver;
+// to consume what is left first, loop on [Receiver.TryRecv] until
+// ErrEmpty or ErrClosed, which drains and deregisters.
 func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
 	return rx.recvLoop(ctx)
 }
@@ -443,6 +474,24 @@ func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
 // sleeping is matched by a waiters-- on the next iteration's lock,
 // without an extra mu acquisition. Early exits (rx-close, ctx-cancel)
 // drop through the defer to release the same accounting.
+//
+// The whole closed > cancelled > value precedence is evaluated in one
+// ordered run under mu, rather than split between a lock-free probe and
+// the locked body. Two reasons. The terminal exit carries a tear-down
+// obligation — unregisterLocked — that has to happen under the same lock
+// that decided the receiver was terminal; when the cancelled path had its
+// own copy of that decision it silently grew its own bare return instead
+// (fixed, and pinned by TestRecvContextCancelledCloseUnregisters). And
+// the cancellation check must sit above the value read, or the only
+// cancellation arm would be the <-ctxDone below, reachable only once
+// parked — so a receiver looping on RecvContext against a sender fast
+// enough to keep a value always ready would take the value return every
+// iteration and never observe its own shutdown signal. Pinned by
+// TestRecvContextCancelBeatsPendingValue.
+//
+// Recv passes context.Background(), whose Done() is nil; a nil channel in
+// a select is never ready, so the cancellation check falls straight
+// through to default on that path.
 func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 	var z T
 	ctxDone := ctx.Done()
@@ -471,15 +520,30 @@ func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 			rx.s.mu.Unlock()
 			return z, gochan.ErrClosed
 		}
+		// closed: the sender is gone and this receiver has caught up, so
+		// nothing can arrive again. Equivalent to the old post-read
+		// "ErrEmpty && txClosed" test — tryReadLocked reports ErrEmpty
+		// exactly when writePos == rx.pos — but hoisted above the
+		// cancellation check, which is what makes it outrank it. A closed
+		// sender with values still ahead of rx.pos fails this and keeps
+		// draining through the read below.
+		if rx.s.txClosed.Load() && rx.s.writePos.Load() == rx.pos {
+			rx.unregisterLocked()
+			rx.s.mu.Unlock()
+			return z, gochan.ErrClosed
+		}
+		// cancelled: above the read, so a ready value cannot starve it.
+		select {
+		case <-ctxDone:
+			rx.s.mu.Unlock()
+			return z, ctx.Err()
+		default:
+		}
+		// value, or ErrLagged.
 		v, err := rx.tryReadLocked()
 		if err != gochan.ErrEmpty {
 			rx.s.mu.Unlock()
 			return v, err
-		}
-		if rx.s.txClosed.Load() {
-			rx.unregisterLocked()
-			rx.s.mu.Unlock()
-			return z, gochan.ErrClosed
 		}
 		rx.s.waiters++
 		parked = true

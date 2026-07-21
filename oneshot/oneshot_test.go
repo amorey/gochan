@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/amorey/gochan"
+	"github.com/amorey/gochan/internal/parked"
 )
 
 func newPair[T any](t *testing.T) (tx *Sender[T], rx *Receiver[T]) {
@@ -113,14 +114,16 @@ func TestReceiverCloseBeforeSend(t *testing.T) {
 
 func TestReceiverCloseUnblocksRecv(t *testing.T) {
 	_, rx := newPair[int](t)
-	started := make(chan struct{})
 	done := make(chan error, 1)
+	// Not a `started` channel: that would prove only that the goroutine
+	// was scheduled, so a Close landing first would be answered by
+	// consume()'s terminal check without Recv ever parking on <-s.done.
+	base := parked.Snapshot(parked.InChanRecv, "oneshot.(*Receiver[...]).Recv(")
 	go func() {
-		close(started)
 		_, err := rx.Recv()
 		done <- err
 	}()
-	<-started
+	base.Wait(t, 1)
 	rx.Close()
 	select {
 	case err := <-done:
@@ -209,18 +212,92 @@ func TestRecvContextSucceeds(t *testing.T) {
 	assert.Equal(t, 9, v)
 }
 
-func TestRecvContextPrefersValueOverCancel(t *testing.T) {
-	// When both ctx is cancelled and a value is available, RecvContext must
-	// deliver the value rather than report ctx.Err().
+// TestRecvContextProbeSeesValue covers RecvContext's non-blocking probe:
+// with a live ctx and the value already in the slot, the call returns
+// without ever reaching the parking select.
+func TestRecvContextProbeSeesValue(t *testing.T) {
+	tx, rx := newPair[int](t)
+	require.NoError(t, tx.Send(11))
+	v, err := rx.RecvContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 11, v)
+}
+
+// TestRecvContextCancelWhileParked covers the parking select's ctx arm:
+// the ctx is live on entry, so the entry-time check passes, and the
+// cancellation lands while the call is blocked with no value available.
+func TestRecvContextCancelWhileParked(t *testing.T) {
+	_, rx := newPair[int](t)
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	// Waiting on a `started` channel closed just before the call would
+	// only prove the goroutine was scheduled: a cancel landing before the
+	// entry-time ctx check would be answered there, leaving the arm under
+	// test uncovered with the assertion still passing.
+	base := parked.Snapshot(parked.InSelect, "oneshot.(*Receiver[...]).RecvContext(")
+	go func() {
+		_, err := rx.RecvContext(ctx)
+		errc <- err
+	}()
+	base.Wait(t, 1)
+	cancel()
+	assert.ErrorIs(t, <-errc, context.Canceled)
+}
+
+// TestRecvContextCancelBeatsSentValue pins RecvContext's entry-time ctx
+// check: an already-cancelled ctx returns ctx.Err() even with the value
+// already in the slot, and leaves it there to be consumed by a later
+// Recv rather than discarding it. Looped because the pre-fix code raced
+// the value against the cancellation instead of ordering them.
+func TestRecvContextCancelBeatsSentValue(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		tx, rx := newPair[int](t)
 		require.NoError(t, tx.Send(42))
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		v, err := rx.RecvContext(ctx)
+		_, err := rx.RecvContext(ctx)
+		require.ErrorIs(t, err, context.Canceled)
+
+		v, err := rx.Recv()
 		require.NoError(t, err)
 		assert.Equal(t, 42, v)
 	}
+}
+
+// TestRecvContextClosedBeatsCancel pins the other half of the precedence
+// chain: a termination visible on entry outranks a cancelled ctx, from
+// either side of the pair.
+func TestRecvContextClosedBeatsCancel(t *testing.T) {
+	t.Run("sender closed", func(t *testing.T) {
+		tx, rx := newPair[int](t)
+		tx.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := rx.RecvContext(ctx)
+		assert.ErrorIs(t, err, gochan.ErrClosed)
+	})
+
+	t.Run("receiver closed", func(t *testing.T) {
+		_, rx := newPair[int](t)
+		rx.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := rx.RecvContext(ctx)
+		assert.ErrorIs(t, err, gochan.ErrClosed)
+	})
+
+	t.Run("value already consumed", func(t *testing.T) {
+		tx, rx := newPair[int](t)
+		require.NoError(t, tx.Send(42))
+		v, err := rx.Recv()
+		require.NoError(t, err)
+		require.Equal(t, 42, v)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err = rx.RecvContext(ctx)
+		assert.ErrorIs(t, err, gochan.ErrClosed)
+	})
 }
 
 func TestReceiverCloseAfterSendDropsValue(t *testing.T) {

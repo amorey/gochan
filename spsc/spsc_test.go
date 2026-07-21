@@ -123,12 +123,18 @@ func TestRecvContextCancel(t *testing.T) {
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
-func TestRecvContextPrefersValueOverCancel(t *testing.T) {
+// TestRecvContextCancelBeatsBufferedValue mirrors mpmc's test of the same
+// name: a cancelled ctx outranks a buffered value, and the value stays in
+// the queue.
+func TestRecvContextCancelBeatsBufferedValue(t *testing.T) {
 	tx, rx := newPair[int](t, 1)
 	require.NoError(t, tx.Send(5))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	v, err := rx.RecvContext(ctx)
+	_, err := rx.RecvContext(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+
+	v, err := rx.TryRecv()
 	require.NoError(t, err)
 	assert.Equal(t, 5, v)
 }

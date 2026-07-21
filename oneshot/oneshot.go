@@ -103,10 +103,24 @@ func (tx *Sender[T]) Send(v T) error {
 // TrySend is equivalent to Send: oneshot Send never blocks.
 func (tx *Sender[T]) TrySend(v T) error { return tx.Send(v) }
 
-// SendContext returns ctx.Err() if ctx is already cancelled; otherwise it
-// behaves like Send. Send never blocks, so there is nothing for cancellation
-// to interrupt mid-call.
+// SendContext behaves like Send, but reports an already-cancelled ctx
+// instead of sending. Send never blocks, so there is nothing for
+// cancellation to interrupt mid-call.
+//
+// Precedence is closed > cancelled: a sender already closed on entry
+// reports [gochan.ErrClosed] even for an already-cancelled ctx, since
+// that is the durable answer and a retry with a fresh context would only
+// return it again. A cancelled ctx on a live sender still reports
+// ctx.Err(). Pinned by the root package's conformance table.
 func (tx *Sender[T]) SendContext(ctx context.Context, v T) error {
+	// s.done closes on the first terminal event of either side, which is
+	// exactly when Send would report ErrClosed — so this is an exact
+	// terminal test and needs no lock.
+	select {
+	case <-tx.s.done:
+		return gochan.ErrClosed
+	default:
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -152,19 +166,23 @@ func (rx *Receiver[T]) TryRecv() (T, error) {
 
 // RecvContext blocks until the value is sent or ctx is cancelled. Cancelling
 // the context does not close the receiver.
+//
+// Precedence is closed > cancelled > value, applied by [Receiver.resolve]
+// in one pass over the slot: a pair already closed without a pending value
+// reports [gochan.ErrClosed] even for a cancelled ctx, since that is the
+// durable answer no retry could change, while a cancelled ctx on a live
+// pair outranks an already-sent value and leaves it in the slot for a
+// later Recv. Once parked, a value and a cancellation landing together
+// resolve at random.
 func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
-	s := rx.s
-	// Prefer a ready value over a cancelled context when both are available.
-	select {
-	case <-s.done:
-		return rx.consume()
-	default:
+	if v, err, ok := rx.resolve(ctx.Err()); ok {
+		return v, err
 	}
 	select {
 	case <-ctx.Done():
 		var z T
 		return z, ctx.Err()
-	case <-s.done:
+	case <-rx.s.done:
 		return rx.consume()
 	}
 }
@@ -223,19 +241,49 @@ func (rx *Receiver[T]) Close() {
 	}
 }
 
-// consume returns the slot value or ErrClosed if unavailable. Caller must
-// have observed s.done closed (or be the only path that knows it's safe).
-func (rx *Receiver[T]) consume() (T, error) {
+// resolve applies the closed > cancelled > value precedence in a single
+// critical section, reporting whether it reached an answer.
+//
+// One acquisition, not a peek followed by a consume: the terminal test and
+// the value read have to agree with each other, and splitting them across
+// two acquisitions both re-reads the same fields and lets a racing Close
+// land in between. ctxErr is passed in rather than consulted here so the
+// whole ordering is legible in one place — a cancelled ctx loses to an
+// already-terminal pair and beats a waiting value, which it leaves in the
+// slot rather than consuming.
+//
+// ok is false only for a live pair, an empty slot and a live ctx: the one
+// state with no answer yet, where the caller must park. That case carries
+// [gochan.ErrEmpty] rather than a nil error so a caller that knows the
+// pair is terminal can ignore ok without a zero value ever being reported
+// as a successful receive.
+func (rx *Receiver[T]) resolve(ctxErr error) (T, error, bool) {
 	var z T
 	s := rx.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.hasVal || s.rxClosed {
-		return z, gochan.ErrClosed
+	switch {
+	case s.txClosed || s.rxClosed:
+		return z, gochan.ErrClosed, true
+	case ctxErr != nil:
+		return z, ctxErr, true
+	case s.hasVal:
+		v := s.val
+		s.val = z
+		s.hasVal = false
+		s.rxClosed = true
+		return v, nil, true
 	}
-	v := s.val
-	s.val = z
-	s.hasVal = false
-	s.rxClosed = true
-	return v, nil
+	return z, gochan.ErrEmpty, false
+}
+
+// consume returns the slot value or ErrClosed if unavailable. Callers must
+// have observed s.done closed, which makes the pair terminal, so resolve
+// always reaches an answer and ok is discarded rather than branched on —
+// a branch on it would be unreachable. Should that invariant ever break,
+// resolve's undecided case reports ErrEmpty, so the failure would surface
+// as an unexpected error rather than as a zero value with a nil error.
+func (rx *Receiver[T]) consume() (T, error) {
+	v, err, _ := rx.resolve(nil)
+	return v, err
 }

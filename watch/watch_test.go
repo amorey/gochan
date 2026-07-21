@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/amorey/gochan"
+	"github.com/amorey/gochan/internal/parked"
 )
 
 func newHub[T any](t *testing.T, initial T) *Hub[T] {
@@ -31,7 +32,7 @@ func newRx[T any](t *testing.T, h *Hub[T]) *Receiver[T] {
 }
 
 func TestImplementsCommonInterfaces(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	tx := newTx(t, h)
 	rx := newRx(t, h)
 	var _ gochan.Sender[int] = tx
@@ -39,12 +40,12 @@ func TestImplementsCommonInterfaces(t *testing.T) {
 }
 
 func TestSenderSingleton(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	assert.Same(t, h.Sender(), h.Sender())
 }
 
 func TestFreshReceiverSeesInitialValue(t *testing.T) {
-	h := newHub[string](t, "seed")
+	h := newHub(t, "seed")
 	rx := newRx(t, h)
 	v, err := rx.Recv()
 	require.NoError(t, err)
@@ -52,7 +53,7 @@ func TestFreshReceiverSeesInitialValue(t *testing.T) {
 }
 
 func TestLateSubscriberSeesCurrentValue(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	tx := newTx(t, h)
 	require.NoError(t, tx.Send(7))
 	require.NoError(t, tx.Send(42))
@@ -64,7 +65,7 @@ func TestLateSubscriberSeesCurrentValue(t *testing.T) {
 }
 
 func TestRecvBlocksUntilChange(t *testing.T) {
-	h := newHub[int](t, 1)
+	h := newHub(t, 1)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 
@@ -90,7 +91,7 @@ func TestRecvBlocksUntilChange(t *testing.T) {
 }
 
 func TestSendCoalescesIntermediateValues(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 
@@ -114,7 +115,7 @@ func TestSendCoalescesIntermediateValues(t *testing.T) {
 }
 
 func TestSendNeverBlocks(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	tx := newTx(t, h)
 	// No receivers; Send must still succeed and not block.
 	done := make(chan struct{})
@@ -132,7 +133,7 @@ func TestSendNeverBlocks(t *testing.T) {
 }
 
 func TestTrySendEquivalentToSend(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 
@@ -149,7 +150,7 @@ func TestTrySendEquivalentToSend(t *testing.T) {
 }
 
 func TestTryRecvEmptyThenValueThenClosed(t *testing.T) {
-	h := newHub[int](t, 99)
+	h := newHub(t, 99)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 
@@ -173,7 +174,7 @@ func TestTryRecvEmptyThenValueThenClosed(t *testing.T) {
 }
 
 func TestSenderCloseDeliversFinalValueOnce(t *testing.T) {
-	h := newHub[int](t, 1)
+	h := newHub(t, 1)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 	// Drain initial.
@@ -193,7 +194,7 @@ func TestSenderCloseDeliversFinalValueOnce(t *testing.T) {
 }
 
 func TestSenderCloseCaughtUpReceiverSeesErrClosed(t *testing.T) {
-	h := newHub[int](t, 1)
+	h := newHub(t, 1)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 
@@ -206,7 +207,7 @@ func TestSenderCloseCaughtUpReceiverSeesErrClosed(t *testing.T) {
 }
 
 func TestSenderCloseLiveReceiverDrainsFinalValue(t *testing.T) {
-	h := newHub[int](t, 1)
+	h := newHub(t, 1)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 	// Drain initial.
@@ -225,7 +226,7 @@ func TestSenderCloseLiveReceiverDrainsFinalValue(t *testing.T) {
 }
 
 func TestPostSenderCloseReceiverDeliversFinalThenClosed(t *testing.T) {
-	h := newHub[int](t, 5)
+	h := newHub(t, 5)
 	tx := newTx(t, h)
 	require.NoError(t, tx.Send(6))
 	tx.Close()
@@ -240,14 +241,14 @@ func TestPostSenderCloseReceiverDeliversFinalThenClosed(t *testing.T) {
 }
 
 func TestSenderCloseIdempotent(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	tx := newTx(t, h)
 	tx.Close()
 	tx.Close()
 }
 
 func TestHubCloseHardClosesSenderAndReceivers(t *testing.T) {
-	h := newHub[int](t, 7)
+	h := newHub(t, 7)
 	tx := newTx(t, h)
 	rx := newRx(t, h)
 
@@ -267,7 +268,7 @@ func TestHubCloseHardClosesSenderAndReceivers(t *testing.T) {
 }
 
 func TestHubCloseReceiverObtainedAfterIsPreClosed(t *testing.T) {
-	h := newHub[int](t, 7)
+	h := newHub(t, 7)
 	h.Close()
 
 	rx := newRx(t, h)
@@ -278,7 +279,7 @@ func TestHubCloseReceiverObtainedAfterIsPreClosed(t *testing.T) {
 }
 
 func TestHubCloseWakesBlockedRecv(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	// Drain initial so the next Recv blocks.
 	_, err := rx.Recv()
@@ -301,7 +302,7 @@ func TestHubCloseWakesBlockedRecv(t *testing.T) {
 }
 
 func TestHubCloseClosesChan(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	ch := rx.Chan()
 	// Drain initial.
@@ -326,7 +327,7 @@ func TestSoftCloseDoesNotLeakReceivers(t *testing.T) {
 	// via the Sender.Close soft path must deregister from the hub's
 	// receiver registry, otherwise long-lived hubs leak each
 	// abandoned receiver until Hub.Close.
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	tx := newTx(t, h)
 	tx.Close()
 
@@ -341,7 +342,7 @@ func TestSoftCloseDoesNotLeakReceivers(t *testing.T) {
 }
 
 func TestSoftCloseTryRecvDeregisters(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	tx := newTx(t, h)
 	rx := h.Receiver()
 	_, err := rx.Recv() // drains initial
@@ -354,7 +355,7 @@ func TestSoftCloseTryRecvDeregisters(t *testing.T) {
 }
 
 func TestSoftCloseFeedDeregisters(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	tx := newTx(t, h)
 	rx := h.Receiver()
 	ch := rx.Chan()
@@ -378,7 +379,7 @@ func TestSoftCloseFeedDeregisters(t *testing.T) {
 func TestSenderCloseStillDeliversFinalValueAfterHubChange(t *testing.T) {
 	// Regression guard: tightening Hub.Close must not break the
 	// Sender.Close soft-drain path.
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	tx := newTx(t, h)
 	rx := newRx(t, h)
 	require.NoError(t, tx.Send(99))
@@ -393,14 +394,14 @@ func TestSenderCloseStillDeliversFinalValueAfterHubChange(t *testing.T) {
 }
 
 func TestReceiverCloseIdempotent(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	rx.Close()
 	rx.Close()
 }
 
 func TestReceiverCloseAbandonsPendingValue(t *testing.T) {
-	h := newHub[int](t, 1)
+	h := newHub(t, 1)
 	rx := newRx(t, h)
 	// Don't drain initial.
 	rx.Close()
@@ -412,7 +413,7 @@ func TestReceiverCloseAbandonsPendingValue(t *testing.T) {
 }
 
 func TestReceiverCloseDoesNotAffectOthers(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	a := newRx(t, h)
 	b := newRx(t, h)
 	tx := newTx(t, h)
@@ -433,7 +434,7 @@ func TestReceiverCloseDoesNotAffectOthers(t *testing.T) {
 }
 
 func TestReceiverCloseDoesNotCloseSender(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 	rx.Close()
@@ -448,7 +449,7 @@ func TestReceiverCloseDoesNotCloseSender(t *testing.T) {
 }
 
 func TestReceiverCloseWakesBlockedRecv(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	// Drain initial so the next Recv parks.
 	_, _ = rx.Recv()
@@ -476,7 +477,7 @@ func TestReceiverCloseRacingPendingValue(t *testing.T) {
 	// both, never neither.
 	const iters = 2000
 	for i := 0; i < iters; i++ {
-		h := newHub[int](t, 0)
+		h := newHub(t, 0)
 		tx := newTx(t, h)
 		rx := newRx(t, h)
 		_, _ = rx.Recv() // drain initial
@@ -514,7 +515,7 @@ func TestReceiverCloseRacingPendingValue(t *testing.T) {
 }
 
 func TestRecvReceiverCloseBetweenPrecheckAndLock(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	rx.forTestingBeforeRecvLock = func() {
 		rx.Close()
@@ -525,7 +526,7 @@ func TestRecvReceiverCloseBetweenPrecheckAndLock(t *testing.T) {
 }
 
 func TestTryRecvReceiverCloseBetweenPrecheckAndLock(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	rx.forTestingBeforeTryRecvLock = func() {
 		rx.Close()
@@ -536,7 +537,7 @@ func TestTryRecvReceiverCloseBetweenPrecheckAndLock(t *testing.T) {
 }
 
 func TestSenderCloseWakesBlockedRecv(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 	_, _ = rx.Recv()
@@ -555,8 +556,24 @@ func TestSenderCloseWakesBlockedRecv(t *testing.T) {
 	}
 }
 
+// waitParked spins until at least n receivers are parked in recvLoop.
+// Sleep-free and deterministic: it returns as soon as the waiters
+// counter — incremented under mu immediately before the parking
+// select — reaches n.
+func waitParked(t *testing.T, h *Hub[int], n int) {
+	t.Helper()
+	parked.WaitCount(t, "parked receivers", n, func() int {
+		h.s.mu.Lock()
+		defer h.s.mu.Unlock()
+		return h.s.waiters
+	})
+}
+
+// TestRecvContextCancel covers recvLoop's parked <-ctxDone arm: the ctx
+// is live past the loop-top probe, and the cancellation lands only once
+// the receiver is actually blocked.
 func TestRecvContextCancel(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	_, _ = rx.Recv()
 
@@ -566,6 +583,7 @@ func TestRecvContextCancel(t *testing.T) {
 		_, err := rx.RecvContext(ctx)
 		done <- err
 	}()
+	waitParked(t, h, 1)
 	cancel()
 	select {
 	case err := <-done:
@@ -575,19 +593,39 @@ func TestRecvContextCancel(t *testing.T) {
 	}
 }
 
-func TestRecvContextPrefersValue(t *testing.T) {
-	h := newHub[int](t, 7)
+// TestRecvContextCancelBeatsPendingValue pins recvLoop's entry-time ctx
+// check: an already-cancelled ctx returns ctx.Err() even though this
+// fresh receiver has a value pending, and does not mark it as observed —
+// the next Recv still bootstraps with it.
+func TestRecvContextCancelBeatsPendingValue(t *testing.T) {
+	h := newHub(t, 7)
 	rx := newRx(t, h)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	v, err := rx.RecvContext(ctx)
+	_, err := rx.RecvContext(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+
+	v, err := rx.Recv()
 	require.NoError(t, err)
 	assert.Equal(t, 7, v)
 }
 
+// TestRecvContextClosedBeatsCancel pins the other half of recvLoop's
+// entry-time precedence: a closed receiver outranks a cancelled ctx.
+func TestRecvContextClosedBeatsCancel(t *testing.T) {
+	h := newHub(t, 7)
+	rx := newRx(t, h)
+	rx.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := rx.RecvContext(ctx)
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+}
+
 func TestSendContextRespectsCanceled(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	_ = newRx(t, h)
 	tx := newTx(t, h)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -596,7 +634,7 @@ func TestSendContextRespectsCanceled(t *testing.T) {
 }
 
 func TestSendContextDeliversWhenLive(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 	_, _ = rx.Recv()
@@ -607,7 +645,7 @@ func TestSendContextDeliversWhenLive(t *testing.T) {
 }
 
 func TestChanDelivers(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 	ch := rx.Chan()
@@ -632,7 +670,7 @@ func TestChanDelivers(t *testing.T) {
 }
 
 func TestChanClosesOnSenderClose(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 	ch := rx.Chan()
@@ -649,7 +687,7 @@ func TestChanClosesOnSenderClose(t *testing.T) {
 }
 
 func TestChanClosesOnReceiverClose(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	ch := rx.Chan()
 	<-ch
@@ -663,7 +701,7 @@ func TestChanClosesOnReceiverClose(t *testing.T) {
 }
 
 func TestChanReturnsSame(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	a := rx.Chan()
 	b := rx.Chan()
@@ -676,7 +714,7 @@ func TestChanReturnsSame(t *testing.T) {
 // stale value. The feeder must not commit a value as "seen" before
 // it is actually delivered to the consumer.
 func TestChanCoalescesWhileConsumerSlow(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 
@@ -718,7 +756,7 @@ func TestConcurrentPublishersOnSingletonSender(t *testing.T) {
 	// The sender is a singleton handle safe to share across goroutines.
 	const writers = 8
 	const writesPer = 200
-	h := newHub[int](t, -1)
+	h := newHub(t, -1)
 	tx := newTx(t, h)
 	rx := newRx(t, h)
 
@@ -755,7 +793,7 @@ func TestConcurrentPublishersOnSingletonSender(t *testing.T) {
 func TestConcurrentReceivers(t *testing.T) {
 	const readers = 6
 	const sends = 500
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	tx := newTx(t, h)
 
 	rxs := make([]*Receiver[int], readers)
@@ -795,7 +833,7 @@ func TestConcurrentReceivers(t *testing.T) {
 }
 
 func TestEachReceiverIndependentLastSeen(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	a := newRx(t, h)
 	tx := newTx(t, h)
 	// Drain initial on a.
@@ -826,7 +864,7 @@ func TestRecvSelectWakesOnReceiverClose(t *testing.T) {
 	for _, op := range ops {
 		t.Run(op.name, func(t *testing.T) {
 			for i := 0; i < 50; i++ {
-				h := newHub[int](t, 0)
+				h := newHub(t, 0)
 				_ = newTx(t, h)
 				rx := newRx(t, h)
 				// Consume the initial value so the next call blocks.
@@ -853,7 +891,7 @@ func TestRecvSelectWakesOnReceiverClose(t *testing.T) {
 // not reading); Close fires done, unblocking the feeder via the done arm.
 // Uses the forTestingFeederParked to synchronize deterministically.
 func TestChanFeederBailsOnReceiverClose(t *testing.T) {
-	h := newHub[int](t, 0)
+	h := newHub(t, 0)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
 	parked := make(chan struct{}, 4)
@@ -934,7 +972,7 @@ func TestRecvCloseRace(t *testing.T) {
 	for _, c := range consumers {
 		t.Run(c.name, func(t *testing.T) {
 			for i := 0; i < 200; i++ {
-				h := newHub[int](t, 0)
+				h := newHub(t, 0)
 				tx := newTx(t, h)
 				rx := newRx(t, h)
 				stop := make(chan struct{})
@@ -966,4 +1004,26 @@ func TestRecvCloseRace(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRecvContextCancelledCloseUnregisters pins that the cancelled-ctx
+// path reports ErrClosed *and* drops the receiver from s.receivers, as
+// the drain-to-close path does; otherwise it stays in the notify cohort
+// for the hub's lifetime.
+func TestRecvContextCancelledCloseUnregisters(t *testing.T) {
+	h := newHub(t, 0)
+	tx := newTx(t, h)
+	rx := newRx(t, h)
+	_, err := rx.Recv() // consume the initial value
+	require.NoError(t, err)
+	tx.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = rx.RecvContext(ctx)
+	require.ErrorIs(t, err, gochan.ErrClosed)
+
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	assert.Empty(t, h.s.receivers, "receiver still registered with the hub")
 }

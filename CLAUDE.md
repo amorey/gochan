@@ -30,14 +30,19 @@ semantics tables, error meanings). When changing public behavior, update
   all packages). For `watch`, use `Sender.Close()` if you want subscribers
   to observe the final value once before shutdown — `Hub.Close()` skips
   that drain.
-- `internal/chancore/` — shared building blocks used by the chan-backed
-  packages (`spsc`, `spmc`, `mpsc`, `mpmc`). Not part of the public API.
+- `internal/chancore/` — shared building blocks for the chan-backed
+  packages. `mpmc` is the only direct consumer; `spmc` and `mpsc` wrap
+  `mpmc`, and `spsc` wraps `mpsc`, so all four share this core. Not part
+  of the public API. (`broadcast` and `watch` use only `CloseOnce`.)
   - `CloseOnce` — one-shot termination signal (atomic flag + done channel).
-  - `BufferedSend[T]` / `BufferedRecv[T]` — shared send/recv cores that
-    handle the value channel, a `Dead` termination signal, an optional
-    `Ready` readiness latch (drives `ErrNotReady` on `TrySend`/`TryRecv`
-    before any counterparty has registered), and a `ChClosed` atomic
-    fast-path so senders never write to a closed channel.
+  - `BufferedSend[T]` — shared send core that handles the value channel, a
+    `Dead` termination signal, a required `Ready` readiness latch (drives
+    `ErrNotReady` on `TrySend` before any counterparty has registered), and
+    a `ChClosed` atomic fast-path so senders never write to a closed
+    channel. There is no matching recv core: the receiver needs a
+    per-handle close arm, so `mpmc`'s receive loops live in `mpmc` itself.
+    `Dead` and `Ready` are both required — a send-side with no readiness
+    condition passes an already-latched `CloseOnce` rather than nil.
 
   Prefer extending `chancore` over duplicating select/close logic across
   packages.

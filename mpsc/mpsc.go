@@ -133,8 +133,11 @@ func (tx *Sender[T]) Send(v T) error { return tx.tx.Send(v) }
 // full, [gochan.ErrClosed] if closed, or nil on success.
 func (tx *Sender[T]) TrySend(v T) error { return tx.tx.TrySend(v) }
 
-// SendContext blocks like Send but returns ctx.Err() if ctx is
-// cancelled before the value is enqueued.
+// SendContext blocks like Send but returns ctx.Err() if ctx is cancelled
+// before the value is enqueued. A close already visible on entry outranks
+// an already-cancelled ctx and yields [gochan.ErrClosed]; once the call is
+// parked, a close and a cancellation landing together resolve at random,
+// so treat either error as terminal for this send.
 func (tx *Sender[T]) SendContext(ctx context.Context, v T) error {
 	return tx.tx.SendContext(ctx, v)
 }
@@ -150,7 +153,9 @@ func (tx *Sender[T]) Close() { tx.tx.Close() }
 // Recv blocks until a value is available. Returns the next value in
 // FIFO order, or [gochan.ErrClosed] if the buffer is empty and every
 // sender has closed, this receiver is closed, or the hub has been
-// closed.
+// closed. A close racing an in-flight Recv is ordered as documented on
+// [mpmc.Receiver.Recv]: a close visible on entry wins, a value already in
+// hand wins over one landing mid-call, and no value is dropped either way.
 func (rx *Receiver[T]) Recv() (T, error) { return rx.rx.Recv() }
 
 // TryRecv is non-blocking. Returns the next value if one is buffered,
@@ -162,6 +167,19 @@ func (rx *Receiver[T]) TryRecv() (T, error) { return rx.rx.TryRecv() }
 
 // RecvContext blocks like Recv but returns ctx.Err() if ctx is
 // cancelled first. Cancellation does not close the receiver.
+//
+// Precedence is closed > cancelled > value. A termination visible on
+// entry — this receiver closed, the hub closed, or every sender closed
+// with the buffer drained — reports [gochan.ErrClosed] even for an
+// already-cancelled ctx. Otherwise a cancelled ctx reports ctx.Err()
+// *even when a value is buffered*, leaving that value in the queue
+// rather than consuming it, so a worker looping on RecvContext still
+// observes its own shutdown signal under sustained load. To flush what
+// is buffered after cancelling, loop on [Receiver.TryRecv] until it
+// returns any error: [gochan.ErrEmpty] while a sender is still open,
+// [gochan.ErrClosed] once every sender has closed and the buffer is
+// drained. Waiting for ErrEmpty alone never ends against closed
+// senders.
 func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
 	return rx.rx.RecvContext(ctx)
 }

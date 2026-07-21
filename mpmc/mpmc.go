@@ -148,7 +148,7 @@ func New[T any](capacity int) *Hub[T] {
 	s.txReady.Init()
 	s.send = chancore.BufferedSend[T]{
 		Ch:        s.ch,
-		Dead:      s.dead.Done(),
+		Dead:      &s.dead,
 		Ready:     &s.rxReady,
 		ChClosed:  &s.chClosed,
 		SendLock:  s.chMu.RLocker(),
@@ -234,7 +234,10 @@ func (tx *Sender[T]) TrySend(v T) error {
 }
 
 // SendContext blocks like Send but returns ctx.Err() if ctx is cancelled
-// before the value is enqueued.
+// before the value is enqueued. A close already visible on entry outranks
+// an already-cancelled ctx and yields [gochan.ErrClosed]; once the call is
+// parked, a close and a cancellation landing together resolve at random,
+// so treat either error as terminal for this send.
 func (tx *Sender[T]) SendContext(ctx context.Context, v T) error {
 	if tx.closed {
 		return gochan.ErrClosed
@@ -268,23 +271,26 @@ func (tx *Sender[T]) Close() {
 // next value in the shared FIFO, or [gochan.ErrClosed] if the buffer is
 // empty and every sender has closed, this receiver is closed, or the
 // hub has been closed.
+//
+// Close and a buffered value are ordered as follows. A close already
+// observable when Recv is entered wins: the call returns ErrClosed and
+// leaves any buffered values in the shared FIFO for the remaining live
+// receivers. Past that point a buffered value wins over a close landing
+// mid-call, and is returned to the caller — the caller is expected to
+// handle a value it successfully received even if it is concurrently
+// shutting this handle down. Either way no value is lost: it is delivered
+// here or left in the queue, never consumed and discarded. Which side of
+// that boundary a concurrent Close falls on is a race and not something
+// callers should depend on.
+//
+// Recv is RecvContext with a context that is never cancelled, and
+// delegates rather than repeating it: Background's Err() is nil and its
+// Done() is a nil channel, which is never selected, so the ctx checks and
+// the ctx arm are inert on this path. Keeping one body is what stops a
+// precedence change from landing in one copy and missing the other.
+// Measured at well under 1ns against a hand-inlined duplicate.
 func (rx *Receiver[T]) Recv() (T, error) {
-	var z T
-	s := rx.s
-	if rx.done.IsClosed() || s.dead.IsClosed() {
-		return z, gochan.ErrClosed
-	}
-	select {
-	case <-rx.done.Done():
-		return z, gochan.ErrClosed
-	case <-s.dead.Done():
-		return z, gochan.ErrClosed
-	case v, ok := <-s.ch:
-		if !ok {
-			return z, gochan.ErrClosed
-		}
-		return v, nil
-	}
+	return rx.RecvContext(context.Background())
 }
 
 // TryRecv is non-blocking. Returns the next value if one is buffered,
@@ -314,12 +320,45 @@ func (rx *Receiver[T]) TryRecv() (T, error) {
 
 // RecvContext blocks like Recv but returns ctx.Err() if ctx is cancelled
 // first. Cancellation does not close this receiver.
+//
+// Precedence is closed > cancelled > value, mirroring SendContext: a
+// termination visible on entry outranks a cancelled ctx, and a cancelled
+// ctx outranks a buffered value — without the entry-time ctx check a
+// worker looping on RecvContext under sustained load could miss its own
+// shutdown signal indefinitely. The value is left in the queue, so a
+// cancelled ctx costs at most the one already in flight. Pinned by
+// TestRecvContextCancelBeatsBufferedValue and the module-wide table in
+// the root package's conformance test.
+//
+// Once the call is parked, a close, a value, and a cancellation landing
+// together resolve at random, as with any select.
 func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
 	var z T
 	s := rx.s
 	if rx.done.IsClosed() || s.dead.IsClosed() {
 		return z, gochan.ErrClosed
 	}
+	if err := ctx.Err(); err != nil {
+		// Every sender closed with the buffer drained is as durably
+		// terminal as rx.done or dead, so it belongs on the same side of
+		// the ctx check — but unlike those two it cannot be tested by a
+		// flag alone, since a closed s.ch with values still in it must
+		// keep draining. Testing it here rather than above keeps the
+		// len() off the uncancelled hot path: reaching this line already
+		// means the call is failing.
+		if s.chClosed.Load() && len(s.ch) == 0 {
+			return z, gochan.ErrClosed
+		}
+		return z, err
+	}
+	// Probe non-blockingly before the close-aware select: a single-case
+	// select with default compiles to selectnbrecv, well under the cost of
+	// the four-case selectgo below, and the buffer usually has a value.
+	// This must stay *below* the entry-time close and ctx checks —
+	// hoisting it would let a closed handle strip values out of the shared
+	// FIFO where no live receiver can reach them, and would satisfy a
+	// cancelled caller from the buffer. Pinned by
+	// TestClosedReceiverAbandonsBufferForRecv.
 	select {
 	case v, ok := <-s.ch:
 		if !ok {

@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/amorey/gochan"
+	"github.com/amorey/gochan/internal/parked"
 )
 
 func newHub[T any](t *testing.T, capacity int) *Hub[T] {
@@ -385,6 +386,22 @@ func TestSenderCloseWakesBlockedRecv(t *testing.T) {
 	}
 }
 
+// waitParked spins until at least n receivers are parked in recvLoop.
+// Sleep-free and deterministic: it returns as soon as the waiters
+// counter — incremented under mu immediately before the parking
+// select — reaches n.
+func waitParked(t *testing.T, h *Hub[int], n int) {
+	t.Helper()
+	parked.WaitCount(t, "parked receivers", n, func() int {
+		h.s.mu.Lock()
+		defer h.s.mu.Unlock()
+		return h.s.waiters
+	})
+}
+
+// TestRecvContextCancel covers recvLoop's parked <-ctxDone arm: the ctx
+// is live past the loop-top probe, and the cancellation lands only once
+// the receiver is actually blocked.
 func TestRecvContextCancel(t *testing.T) {
 	h := newHub[int](t, 2)
 	rx := newRx(t, h)
@@ -396,6 +413,7 @@ func TestRecvContextCancel(t *testing.T) {
 		_, err := rx.RecvContext(ctx)
 		done <- err
 	}()
+	waitParked(t, h, 1)
 	cancel()
 	select {
 	case err := <-done:
@@ -405,7 +423,11 @@ func TestRecvContextCancel(t *testing.T) {
 	}
 }
 
-func TestRecvContextPrefersValue(t *testing.T) {
+// TestRecvContextCancelBeatsPendingValue pins recvLoop's entry-time ctx
+// check: an already-cancelled ctx returns ctx.Err() even with a value
+// ready at this receiver's position, and leaves the position untouched
+// so the value is still there afterwards.
+func TestRecvContextCancelBeatsPendingValue(t *testing.T) {
 	h := newHub[int](t, 2)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
@@ -413,9 +435,25 @@ func TestRecvContextPrefersValue(t *testing.T) {
 	require.NoError(t, tx.Send(7))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	v, err := rx.RecvContext(ctx)
+	_, err := rx.RecvContext(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+
+	v, err := rx.TryRecv()
 	require.NoError(t, err)
 	assert.Equal(t, 7, v)
+}
+
+// TestRecvContextClosedBeatsCancel pins the other half of recvLoop's
+// entry-time precedence: a closed receiver outranks a cancelled ctx.
+func TestRecvContextClosedBeatsCancel(t *testing.T) {
+	h := newHub[int](t, 2)
+	rx := newRx(t, h)
+	rx.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := rx.RecvContext(ctx)
+	assert.ErrorIs(t, err, gochan.ErrClosed)
 }
 
 func TestSendContextRespectsCanceled(t *testing.T) {
@@ -758,4 +796,93 @@ func TestRecvCloseRace(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRecvContextCancelledCloseUnregisters pins that the cancelled-ctx
+// path reports ErrClosed *and* tears the receiver down, exactly as the
+// drain-to-close path does. A bare return would leave the receiver in
+// s.receivers and in the minPos cohort TrySend walks, keep rx.done open,
+// and hold the ring's payloads live for the hub's lifetime.
+func TestRecvContextCancelledCloseUnregisters(t *testing.T) {
+	h := newHub[int](t, 2)
+	tx := newTx(t, h)
+	rx := newRx(t, h)
+	require.NoError(t, tx.Send(7))
+	v, err := rx.Recv()
+	require.NoError(t, err)
+	require.Equal(t, 7, v)
+	tx.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = rx.RecvContext(ctx)
+	require.ErrorIs(t, err, gochan.ErrClosed)
+
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	assert.Empty(t, h.s.receivers, "receiver still registered with the hub")
+	assert.True(t, rx.done.IsClosed(), "rx.done left open")
+	assert.Equal(t, make([]int, 2), h.s.buf, "ring payloads not released")
+}
+
+// TestCancelledWithPendingValuesNeedsClose pins the deregistration
+// obligation RecvContext documents. A cancelled ctx never discards a
+// value, so with the sender closed and values still ahead of this
+// receiver no RecvContext ever reaches ErrClosed — the caller has to
+// either drain or Close. Both routes must deregister; stopping at
+// ctx.Err() must not.
+func TestCancelledWithPendingValuesNeedsClose(t *testing.T) {
+	registered := func(h *Hub[int]) int {
+		h.s.mu.Lock()
+		defer h.s.mu.Unlock()
+		return len(h.s.receivers)
+	}
+	newClosedHubWithBacklog := func(t *testing.T) (*Hub[int], *Receiver[int]) {
+		t.Helper()
+		h := newHub[int](t, 4)
+		tx := newTx(t, h)
+		rx := newRx(t, h)
+		for i := 1; i <= 3; i++ {
+			require.NoError(t, tx.Send(i))
+		}
+		tx.Close()
+		return h, rx
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	t.Run("ctx.Err() alone never terminates and never deregisters", func(t *testing.T) {
+		h, rx := newClosedHubWithBacklog(t)
+		for i := 0; i < 5; i++ {
+			_, err := rx.RecvContext(ctx)
+			require.ErrorIs(t, err, context.Canceled, "must not reach ErrClosed while values remain")
+		}
+		assert.Equal(t, 1, registered(h), "still registered, as documented")
+	})
+
+	t.Run("Close deregisters", func(t *testing.T) {
+		h, rx := newClosedHubWithBacklog(t)
+		_, err := rx.RecvContext(ctx)
+		require.ErrorIs(t, err, context.Canceled)
+		rx.Close()
+		assert.Zero(t, registered(h))
+	})
+
+	t.Run("TryRecv drain yields every value, then deregisters", func(t *testing.T) {
+		h, rx := newClosedHubWithBacklog(t)
+		_, err := rx.RecvContext(ctx)
+		require.ErrorIs(t, err, context.Canceled)
+
+		var got []int
+		for {
+			v, err := rx.TryRecv()
+			if err != nil {
+				require.ErrorIs(t, err, gochan.ErrClosed)
+				break
+			}
+			got = append(got, v)
+		}
+		assert.Equal(t, []int{1, 2, 3}, got, "cancellation must not have discarded anything")
+		assert.Zero(t, registered(h))
+	})
 }

@@ -249,10 +249,22 @@ func (tx *Sender[T]) Send(v T) error {
 // common Sender interface.
 func (tx *Sender[T]) TrySend(v T) error { return tx.Send(v) }
 
-// SendContext returns ctx.Err() if ctx is already cancelled;
-// otherwise behaves like Send. Send never blocks, so the context is
-// only checked at entry.
+// SendContext behaves like Send, but reports an already-cancelled ctx
+// instead of publishing. Send never blocks, so the context is only
+// checked at entry.
+//
+// Precedence is closed > cancelled: a sender already closed on entry
+// reports [gochan.ErrClosed] even for an already-cancelled ctx, since
+// that is the durable answer and a retry with a fresh context would only
+// return it again. A cancelled ctx on a live sender still reports
+// ctx.Err(). Pinned by the root package's conformance table.
 func (tx *Sender[T]) SendContext(ctx context.Context, v T) error {
+	// txClosed is the same atomic Send tests under mu, so this entry
+	// check is exact. A close landing between here and Send is reported
+	// by Send's own check, so nothing is lost by not holding mu.
+	if tx.s.txClosed.Load() {
+		return gochan.ErrClosed
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -284,7 +296,25 @@ func (rx *Receiver[T]) Recv() (T, error) {
 }
 
 // RecvContext blocks like Recv but returns ctx.Err() if ctx is
-// cancelled first.
+// cancelled first. Cancellation does not close this receiver.
+//
+// Precedence is closed > cancelled > value. A termination visible on
+// entry — this receiver closed, the hub closed, or the sender closed
+// with no unseen value left — reports [gochan.ErrClosed] even for an
+// already-cancelled ctx. Otherwise a cancelled ctx reports ctx.Err()
+// *even when a new version is pending*, leaving it unread rather than
+// consuming it, so a subscriber looping on RecvContext still observes
+// its own shutdown signal however fast the publisher runs. The pending
+// value is not lost: the next Recv returns it, which is what preserves
+// [Sender.Close]'s soft-drain contract.
+//
+// That also means ctx.Err() is not an end-of-stream: with the sender
+// closed and a version still unseen, every RecvContext on a cancelled
+// ctx reports ctx.Err() and none reaches [gochan.ErrClosed]. Only
+// draining to ErrClosed deregisters a receiver on its own, so a caller
+// that stops on ctx.Err() must [Receiver.Close] — otherwise the handle
+// stays in the hub's notify cohort for its lifetime. `defer rx.Close()`
+// covers this, as it does for any abandoned receiver.
 func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
 	return rx.recvLoop(ctx)
 }
@@ -292,12 +322,31 @@ func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
 // recvLoop is the shared blocking-recv implementation. Recv passes
 // context.Background() to opt out of cancellation — Background's
 // Done() returns nil, and a nil channel in a select arm is never
-// selected, so the cancellation arm is a no-op on that path. The
-// pending-value check sits before the receiver-closed check so that
-// hub-close / sender-close can drain the final value, while explicit
-// receiver-close (via [Receiver.Close]) short-circuits because
-// rx.done is set inside that path and the loop re-checks rx.done at
-// the top of each iteration before consulting state.
+// selected, so the cancellation arm is a no-op on that path. An unseen
+// version is delivered ahead of a sender-close so that hub-close /
+// sender-close can drain the final value, while explicit receiver-close
+// (via [Receiver.Close]) short-circuits because rx.done is set inside
+// that path and the loop re-checks rx.done at the top of each iteration
+// before consulting state.
+//
+// The whole closed > cancelled > value precedence is evaluated in one
+// ordered run under mu, rather than split between a lock-free probe and
+// the locked body. Two reasons. The terminal exit carries a tear-down
+// obligation — dropping this receiver from s.receivers — that has to
+// happen under the same lock that decided it was terminal; when the
+// cancelled path had its own copy of that decision it silently grew its
+// own bare return instead (fixed, and pinned by
+// TestRecvContextCancelledCloseUnregisters). And the cancellation check
+// must sit above the version read, or the only cancellation arm would be
+// the <-ctxDone below, reachable only once parked — so a receiver looping
+// on RecvContext against a publisher fast enough to keep a new version
+// always pending would take the value return every iteration and never
+// observe its own shutdown signal. Pinned by
+// TestRecvContextCancelBeatsPendingValue.
+//
+// Recv passes context.Background(), whose Done() is nil; a nil channel in
+// a select is never ready, so the cancellation check falls straight
+// through to default on that path.
 func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 	var z T
 	ctxDone := ctx.Done()
@@ -329,16 +378,31 @@ func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 			rx.s.mu.Unlock()
 			return z, gochan.ErrClosed
 		}
+		// closed: the sender is gone and this receiver has seen the final
+		// version, so nothing can arrive again. Equivalent to the old
+		// post-read txClosed test — version <= lastSeen is exactly when
+		// the read below would not have fired — but hoisted above the
+		// cancellation check, which is what makes it outrank it. An unseen
+		// version fails this and is still delivered by the read below,
+		// which is what preserves Sender.Close's soft-drain contract.
+		if rx.s.txClosed.Load() && rx.s.version.Load() <= rx.lastSeen {
+			delete(rx.s.receivers, rx)
+			rx.s.mu.Unlock()
+			return z, gochan.ErrClosed
+		}
+		// cancelled: above the read, so a pending version cannot starve it.
+		select {
+		case <-ctxDone:
+			rx.s.mu.Unlock()
+			return z, ctx.Err()
+		default:
+		}
+		// value: the newest version this receiver has not seen.
 		if ver := rx.s.version.Load(); ver > rx.lastSeen {
 			v := rx.s.val
 			rx.lastSeen = ver
 			rx.s.mu.Unlock()
 			return v, nil
-		}
-		if rx.s.txClosed.Load() {
-			delete(rx.s.receivers, rx)
-			rx.s.mu.Unlock()
-			return z, gochan.ErrClosed
 		}
 		rx.s.waiters++
 		parked = true

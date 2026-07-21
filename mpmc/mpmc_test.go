@@ -2,7 +2,6 @@ package mpmc
 
 import (
 	"context"
-	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -13,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/amorey/gochan"
+	"github.com/amorey/gochan/internal/parked"
 )
 
 func newHub[T any](t *testing.T, capacity int) *Hub[T] {
@@ -179,16 +179,35 @@ func TestRecvContextCancel(t *testing.T) {
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
-func TestRecvContextPrefersValueOverCancel(t *testing.T) {
+// TestRecvContextCancelBeatsBufferedValue pins RecvContext's entry-time
+// ctx check: an already-cancelled ctx returns ctx.Err() even with a value
+// waiting, and — the part that matters — leaves that value in the queue
+// for the next receiver rather than consuming and discarding it.
+func TestRecvContextCancelBeatsBufferedValue(t *testing.T) {
 	h := newHub[int](t, 1)
 	tx := newTx(t, h)
 	rx := newRx(t, h)
 	require.NoError(t, tx.Send(99))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	v, err := rx.RecvContext(ctx)
+	_, err := rx.RecvContext(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+
+	v, err := rx.TryRecv()
 	require.NoError(t, err)
 	assert.Equal(t, 99, v)
+}
+
+// TestRecvContextClosedBeatsCancel pins the other half of the precedence
+// chain: a hard termination visible on entry outranks a cancelled ctx.
+func TestRecvContextClosedBeatsCancel(t *testing.T) {
+	h := newHub[int](t, 1)
+	rx := newRx(t, h)
+	rx.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := rx.RecvContext(ctx)
+	assert.ErrorIs(t, err, gochan.ErrClosed)
 }
 
 func TestSenderCloseDoesNotAffectOthers(t *testing.T) {
@@ -248,11 +267,12 @@ func TestRecvContextValueArrivesDuringWait(t *testing.T) {
 		err error
 	}
 	done := make(chan result, 1)
+	base := snapshotRecv("RecvContext")
 	go func() {
 		v, err := rx.RecvContext(context.Background())
 		done <- result{v, err}
 	}()
-	runtime.Gosched()
+	base.Wait(t, 1) // probe has missed; committed to the select
 	require.NoError(t, tx.Send(42))
 	r := <-done
 	require.NoError(t, r.err)
@@ -270,27 +290,25 @@ var recvOps = []recvOp{
 	{"RecvContext", func(rx *Receiver[int]) error { _, err := rx.RecvContext(context.Background()); return err }},
 }
 
-// runParkedRecvHubCloseRace spawns the recv op, ensures it has started
-// (WaitGroup) and then yields (Gosched) so the goroutine reaches the
-// select before Hub.Close fires. Loops to overcome scheduler bias.
-func runParkedRecvHubCloseRace(t *testing.T, op recvOp) {
+// runParkedRecvClose spawns the recv op, waits until it has genuinely
+// parked in the select, and only then fires the trigger — so the arm
+// under test is the one that answers.
+//
+// A WaitGroup signalled before the call cannot do this: it proves only
+// that the goroutine was scheduled, so a trigger landing first would be
+// answered by the entry-time IsClosed checks, and the test would pass
+// having covered the fast path instead of the select.
+func runParkedRecvClose(t *testing.T, op recvOp, trigger func(*Hub[int], *Receiver[int])) {
 	t.Helper()
-	for i := 0; i < 200; i++ {
-		h := newHub[int](t, 0)
-		_ = newTx(t, h)
-		rx := newRx(t, h)
-		var wg sync.WaitGroup
-		wg.Add(1)
-		done := make(chan error, 1)
-		go func() {
-			wg.Done()
-			done <- op.call(rx)
-		}()
-		wg.Wait()
-		runtime.Gosched()
-		h.Close()
-		assert.ErrorIs(t, <-done, gochan.ErrClosed)
-	}
+	h := newHub[int](t, 0)
+	_ = newTx(t, h)
+	rx := newRx(t, h)
+	done := make(chan error, 1)
+	base := snapshotRecv(op.name)
+	go func() { done <- op.call(rx) }()
+	base.Wait(t, 1)
+	trigger(h, rx)
+	assert.ErrorIs(t, <-done, gochan.ErrClosed)
 }
 
 // TestRecvSelectWakesOnHubClose covers the <-s.dead.Done() select arm of
@@ -298,7 +316,9 @@ func runParkedRecvHubCloseRace(t *testing.T, op recvOp) {
 // dead.
 func TestRecvSelectWakesOnHubClose(t *testing.T) {
 	for _, op := range recvOps {
-		t.Run(op.name, func(t *testing.T) { runParkedRecvHubCloseRace(t, op) })
+		t.Run(op.name, func(t *testing.T) {
+			runParkedRecvClose(t, op, func(h *Hub[int], _ *Receiver[int]) { h.Close() })
+		})
 	}
 }
 
@@ -309,22 +329,7 @@ func TestRecvSelectWakesOnHubClose(t *testing.T) {
 func TestRecvSelectWakesOnReceiverClose(t *testing.T) {
 	for _, op := range recvOps {
 		t.Run(op.name, func(t *testing.T) {
-			for i := 0; i < 200; i++ {
-				h := newHub[int](t, 0)
-				_ = newTx(t, h)
-				rx := newRx(t, h)
-				var wg sync.WaitGroup
-				wg.Add(1)
-				done := make(chan error, 1)
-				go func() {
-					wg.Done()
-					done <- op.call(rx)
-				}()
-				wg.Wait()
-				runtime.Gosched()
-				rx.Close()
-				assert.ErrorIs(t, <-done, gochan.ErrClosed)
-			}
+			runParkedRecvClose(t, op, func(_ *Hub[int], rx *Receiver[int]) { rx.Close() })
 		})
 	}
 }
@@ -341,29 +346,62 @@ func TestRecvContextProbeSeesChannelClosed(t *testing.T) {
 	assert.ErrorIs(t, err, gochan.ErrClosed)
 }
 
+// snapshotRecv baselines the close-aware select of Receiver's fn ("Recv"
+// or "RecvContext"). Take it before spawning the receiver, then Wait.
+//
+// mpmc has no waiters counter for broadcast's and watch's waitParked to
+// key on. A WaitGroup cannot stand in either — see [parked.Wait]. Recv
+// delegates to RecvContext, so a parked Recv matches both frames; asking
+// for "Recv(" still means "a Recv is parked".
+func snapshotRecv(fn string) *parked.Baseline {
+	frame := "mpmc.(*Receiver[...])." + fn + "("
+	if fn == "RecvContext" {
+		// Recv delegates to RecvContext, so a goroutine parked via Recv
+		// carries both frames. Exclude it, or a test spawning one of each
+		// would trip Wait's over-count check.
+		return parked.Snapshot(parked.InSelect, frame, "mpmc.(*Receiver[...]).Recv(")
+	}
+	return parked.Snapshot(parked.InSelect, frame)
+}
+
 // TestRecvContextSelectWakesOnSendersClosed covers RecvContext's
 // second-select "case v, ok := <-s.ch" with !ok — last sender closes the
 // channel while the receiver is parked, dead is not fired. Standalone
 // rather than parameterized because the trigger needs the sender handle
 // returned by newTx.
 func TestRecvContextSelectWakesOnSendersClosed(t *testing.T) {
-	for i := 0; i < 50; i++ {
-		h := newHub[int](t, 0)
-		tx := newTx(t, h)
-		rx := newRx(t, h)
-		var wg sync.WaitGroup
-		wg.Add(1)
-		done := make(chan error, 1)
-		go func() {
-			wg.Done()
-			_, err := rx.RecvContext(context.Background())
-			done <- err
-		}()
-		wg.Wait()
-		runtime.Gosched()
-		tx.Close() // last sender → closes s.ch, does not fire dead
-		assert.ErrorIs(t, <-done, gochan.ErrClosed)
-	}
+	h := newHub[int](t, 0)
+	tx := newTx(t, h)
+	rx := newRx(t, h)
+	done := make(chan error, 1)
+	base := snapshotRecv("RecvContext")
+	go func() {
+		_, err := rx.RecvContext(context.Background())
+		done <- err
+	}()
+	base.Wait(t, 1) // probe has missed; committed to the select
+	tx.Close()      // last sender → closes s.ch, does not fire dead
+	assert.ErrorIs(t, <-done, gochan.ErrClosed)
+}
+
+// TestRecvSelectWakesOnSendersClosed is the Recv twin of
+// TestRecvContextSelectWakesOnSendersClosed, covering Recv's
+// second-select "case v, ok := <-s.ch" with !ok. Previously this arm was
+// only reached incidentally by TestWorkDistribution's scheduling race,
+// which made its coverage flaky.
+func TestRecvSelectWakesOnSendersClosed(t *testing.T) {
+	h := newHub[int](t, 0)
+	tx := newTx(t, h)
+	rx := newRx(t, h)
+	done := make(chan error, 1)
+	base := snapshotRecv("Recv")
+	go func() {
+		_, err := rx.Recv()
+		done <- err
+	}()
+	base.Wait(t, 1) // probe has missed; committed to the select
+	tx.Close()      // last sender → closes s.ch, does not fire dead
+	assert.ErrorIs(t, <-done, gochan.ErrClosed)
 }
 
 func TestReceiverCloseIdempotent(t *testing.T) {
@@ -489,6 +527,42 @@ func TestHubCloseAbandonsBufferForRecv(t *testing.T) {
 	h.Close()
 	_, err := rx.Recv()
 	assert.ErrorIs(t, err, gochan.ErrClosed)
+}
+
+// TestClosedReceiverAbandonsBufferForRecv pins the precedence between the
+// non-blocking probe at the top of Recv/RecvContext/TryRecv and the
+// entry-time close checks above it. A closed handle must lose the buffered
+// value back to the queue, not consume it: the probe optimizes the
+// already-live path and must never be hoisted above the close checks, or a
+// receiver the caller believes is shut down would strip work items out of
+// the shared FIFO where no live worker can reach them.
+func TestClosedReceiverAbandonsBufferForRecv(t *testing.T) {
+	recvs := map[string]func(rx *Receiver[int]) (int, error){
+		"Recv":        func(rx *Receiver[int]) (int, error) { return rx.Recv() },
+		"RecvContext": func(rx *Receiver[int]) (int, error) { return rx.RecvContext(context.Background()) },
+		"TryRecv":     func(rx *Receiver[int]) (int, error) { return rx.TryRecv() },
+	}
+	for name, recv := range recvs {
+		t.Run(name, func(t *testing.T) {
+			h := newHub[int](t, 4)
+			tx := newTx(t, h)
+			dead := newRx(t, h)
+			live := newRx(t, h)
+			require.NoError(t, tx.Send(1))
+			require.NoError(t, tx.Send(2))
+
+			dead.Close()
+			_, err := recv(dead)
+			require.ErrorIs(t, err, gochan.ErrClosed)
+
+			// Both values must still be in the shared FIFO, in order.
+			for _, want := range []int{1, 2} {
+				v, err := live.Recv()
+				require.NoError(t, err)
+				assert.Equal(t, want, v)
+			}
+		})
+	}
 }
 
 func TestHubCloseAllowsChanDrain(t *testing.T) {

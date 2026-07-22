@@ -210,6 +210,47 @@ func TestRecvContextClosedBeatsCancel(t *testing.T) {
 	assert.ErrorIs(t, err, gochan.ErrClosed)
 }
 
+// TestRecvContextDrainedSenderCloseBeatsCancel covers the third arm of
+// that precedence, which the two tests above miss. Here the receiver is
+// live — so the entry-time hard-termination check falls through — and the
+// ctx is cancelled, but every sender has closed with the buffer drained.
+// That is as durably terminal as a closed handle, so it must report
+// ErrClosed rather than ctx.Err(): a shutdown loop that cancels its own
+// context still has to be able to drain to ErrClosed instead of spinning
+// on ctx.Err() forever.
+func TestRecvContextDrainedSenderCloseBeatsCancel(t *testing.T) {
+	h := newHub[int](t, 1)
+	tx := newTx(t, h)
+	rx := newRx(t, h)
+	tx.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := rx.RecvContext(ctx)
+	assert.ErrorIs(t, err, gochan.ErrClosed)
+}
+
+// TestRecvContextCancelBeatsUndrainedSenderClose is the boundary case:
+// same closed sender, but with a value still buffered the receive is not
+// terminal yet, so the cancelled ctx wins and the value survives for a
+// later drain.
+func TestRecvContextCancelBeatsUndrainedSenderClose(t *testing.T) {
+	h := newHub[int](t, 1)
+	tx := newTx(t, h)
+	rx := newRx(t, h)
+	require.NoError(t, tx.Send(7))
+	tx.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := rx.RecvContext(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+
+	v, err := rx.TryRecv()
+	require.NoError(t, err)
+	assert.Equal(t, 7, v)
+}
+
 func TestSenderCloseDoesNotAffectOthers(t *testing.T) {
 	h := newHub[int](t, 4)
 	rx := newRx(t, h)

@@ -245,6 +245,12 @@ type Receiver[T any] struct {
 
 	chOnce sync.Once
 	ch     chan T
+
+	// forTestingBeforeRecvLock, if non-nil, is invoked after the
+	// lock-free closed check and before taking s.mu. Tests use it to
+	// deterministically interleave a cancellation or a close with the
+	// re-checks under s.mu; it is nil in production builds.
+	forTestingBeforeRecvLock func()
 }
 
 // New creates a broadcast Hub backed by a ring buffer of the given
@@ -506,6 +512,9 @@ func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 	for {
 		if rx.done.IsClosed() {
 			return z, gochan.ErrClosed
+		}
+		if rx.forTestingBeforeRecvLock != nil {
+			rx.forTestingBeforeRecvLock()
 		}
 		rx.s.mu.Lock()
 		if parked {

@@ -149,6 +149,41 @@ func TestRecvContextPrecedenceConformance(t *testing.T) {
 	}
 }
 
+// TestSenderCloseDrainsBeforeClosedConformance pins the one case where a
+// close does *not* outrank a pending value: sender-close is a graceful
+// end-of-stream, so an already-sent value is delivered first and ErrClosed
+// only follows once nothing is left.
+//
+// This is the counterpart to the receiver-close arm of
+// TestRecvContextPrecedenceConformance, which that table deliberately
+// excludes — see its comment. The two directions are easy to conflate, and
+// getting them backwards is invisible per-package: a package that let
+// sender-close pre-empt the value would still look internally consistent.
+// Here it fails against its siblings.
+//
+// Uniform across all seven packages, by three different mechanisms: the
+// chan-backed four close the value channel (so the buffer drains first),
+// broadcast/watch gate their terminal check on the receiver having caught
+// up, and oneshot's Close is a no-op once the slot holds a value.
+func TestSenderCloseDrainsBeforeClosedConformance(t *testing.T) {
+	for _, a := range architectures {
+		t.Run(a.name, func(t *testing.T) {
+			tx, rx := a.newPair()
+			require.NoError(t, tx.Send(42))
+			tx.Close()
+
+			// The value survives the close that raced it.
+			v, err := rx.Recv()
+			require.NoError(t, err, "sender-close pre-empted a pending value")
+			assert.Equal(t, 42, v)
+
+			// ...and only then is the stream terminal.
+			_, err = rx.Recv()
+			assert.ErrorIs(t, err, gochan.ErrClosed)
+		})
+	}
+}
+
 // TestSendContextPrecedenceConformance is the send-side twin: closed >
 // cancelled. There is no third rank — a send has no ready value competing
 // with the cancellation — but the first step must hold everywhere the

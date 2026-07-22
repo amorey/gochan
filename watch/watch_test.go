@@ -611,6 +611,49 @@ func TestRecvContextCancelBeatsPendingValue(t *testing.T) {
 	assert.Equal(t, 7, v)
 }
 
+// TestRecvContextCancelBeatsValueDeliveredWhileParked covers the same
+// precedence on the parked path rather than the entry-time one. The
+// receiver is already blocked in the parking select when the new version
+// and the cancellation both land, so the wake races between the <-notify
+// and <-ctxDone arms. Either way the next loop iteration re-derives the
+// answer from state and must return ctx.Err() without advancing
+// lastSeen: waking consumes nothing, and the loop-top ctx check sits
+// above the read.
+func TestRecvContextCancelBeatsValueDeliveredWhileParked(t *testing.T) {
+	h := newHub(t, 7)
+	rx := newRx(t, h)
+	tx := newTx(t, h)
+	_, err := rx.Recv() // consume the initial value so the next Recv parks
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := rx.RecvContext(ctx)
+		done <- err
+	}()
+	waitParked(t, h, 1)
+
+	// Cancel from inside Send, under the same mu the write takes, so the
+	// parked receiver is woken by <-notify with a new version genuinely
+	// ready and only then observes the cancellation. Sending first and
+	// cancelling after would let <-ctxDone win the wake outright, and the
+	// value path — the one this test exists to cover — would never run.
+	rx.forTestingBeforeRecvLock = func() { cancel() }
+	require.NoError(t, tx.Send(9))
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("RecvContext did not return after cancel")
+	}
+
+	v, err := rx.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, 9, v, "version marked observed by a cancelled parked receive")
+}
+
 // TestRecvContextClosedBeatsCancel pins the other half of recvLoop's
 // entry-time precedence: a closed receiver outranks a cancelled ctx.
 func TestRecvContextClosedBeatsCancel(t *testing.T) {
@@ -631,6 +674,21 @@ func TestSendContextRespectsCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	assert.ErrorIs(t, tx.SendContext(ctx, 1), context.Canceled)
+}
+
+// TestSendContextClosedBeatsCancel pins SendContext's entry-time
+// precedence: a closed sender outranks an already-cancelled ctx, since
+// ErrClosed is the durable answer and a retry with a fresh ctx would
+// only return it anyway.
+func TestSendContextClosedBeatsCancel(t *testing.T) {
+	h := newHub(t, 0)
+	_ = newRx(t, h)
+	tx := newTx(t, h)
+	tx.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.ErrorIs(t, tx.SendContext(ctx, 1), gochan.ErrClosed)
 }
 
 func TestSendContextDeliversWhenLive(t *testing.T) {

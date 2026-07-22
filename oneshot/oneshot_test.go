@@ -175,6 +175,19 @@ func TestSendContextCancelledReturnsCtxErr(t *testing.T) {
 	require.NoError(t, tx.Send(1))
 }
 
+// TestSendContextClosedBeatsCancel pins SendContext's entry-time
+// precedence: the pair's termination signal outranks an already-cancelled
+// ctx, since ErrClosed is the durable answer and a retry with a fresh ctx
+// would only return it anyway.
+func TestSendContextClosedBeatsCancel(t *testing.T) {
+	tx, _ := newPair[int](t)
+	tx.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.ErrorIs(t, tx.SendContext(ctx, 1), gochan.ErrClosed)
+}
+
 func TestSendContextOK(t *testing.T) {
 	tx, rx := newPair[int](t)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

@@ -144,6 +144,11 @@ type Receiver[T any] struct {
 
 	chOnce sync.Once
 	ch     chan T
+	// chanMode is set once Chan has handed this receiver to its feeder
+	// goroutine. Recv / RecvContext / TryRecv check it and panic: a
+	// second consumer would race the feeder on the cursor and split
+	// values with it.
+	chanMode atomic.Bool
 
 	// forTestingFeederParked, if non-nil, is invoked by the Chan feeder
 	// goroutine each time it snapshots a value and enters the send
@@ -291,7 +296,10 @@ func (tx *Sender[T]) Close() {
 // fresh receiver, then blocks until the value changes again. If the
 // sender publishes multiple times between consecutive Recv calls,
 // only the most recent value is returned.
+//
+// Panics if [Receiver.Chan] has been called on this receiver.
 func (rx *Receiver[T]) Recv() (T, error) {
+	rx.checkNotChanMode()
 	return rx.recvLoop(context.Background())
 }
 
@@ -315,7 +323,10 @@ func (rx *Receiver[T]) Recv() (T, error) {
 // that stops on ctx.Err() must [Receiver.Close] — otherwise the handle
 // stays in the hub's notify cohort for its lifetime. `defer rx.Close()`
 // covers this, as it does for any abandoned receiver.
+//
+// Panics if [Receiver.Chan] has been called on this receiver.
 func (rx *Receiver[T]) RecvContext(ctx context.Context) (T, error) {
+	rx.checkNotChanMode()
 	return rx.recvLoop(ctx)
 }
 
@@ -422,7 +433,10 @@ func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 // observed it, [gochan.ErrEmpty] if caught up, or [gochan.ErrClosed]
 // if the receiver/hub is closed and the final value has been
 // observed.
+//
+// Panics if [Receiver.Chan] has been called on this receiver.
 func (rx *Receiver[T]) TryRecv() (T, error) {
+	rx.checkNotChanMode()
 	var z T
 	if rx.done.IsClosed() {
 		return z, gochan.ErrClosed
@@ -471,8 +485,15 @@ func (rx *Receiver[T]) TryRecv() (T, error) {
 // Abandoning the channel without calling [Receiver.Close] pins the
 // feeder goroutine — it will park forever waiting for the next
 // value. Always Close the receiver when you stop reading.
+//
+// Chan hands the receiver over to the feeder goroutine: once it has
+// been called, read only from the returned channel. Recv, RecvContext
+// and TryRecv on the same receiver panic, since a second consumer
+// would race the feeder and split values with it. Close is still
+// allowed (and required when you stop reading).
 func (rx *Receiver[T]) Chan() <-chan T {
 	rx.chOnce.Do(func() {
+		rx.chanMode.Store(true)
 		rx.ch = make(chan T)
 		go rx.feed()
 	})
@@ -546,6 +567,16 @@ func (rx *Receiver[T]) feed() {
 		case <-rx.done.Done():
 			return
 		}
+	}
+}
+
+// checkNotChanMode panics if [Receiver.Chan] has been called on rx.
+// Once Chan has run, the feeder goroutine is the receiver's only
+// consumer; a direct read would race it on the cursor and steal
+// values the channel reader expects.
+func (rx *Receiver[T]) checkNotChanMode() {
+	if rx.chanMode.Load() {
+		panic("watch: Recv/RecvContext/TryRecv called on a receiver after Chan; read from the channel instead")
 	}
 }
 

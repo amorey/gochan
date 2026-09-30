@@ -75,3 +75,13 @@ semantics tables, error meanings). When changing public behavior, update
 - Use [testify](https://github.com/stretchr/testify) (`assert` and `require`) for assertions in tests.
 - Do not use magic sleeps (`time.Sleep`, or `time.After` timeouts whose duration encodes an assumption about scheduling) to coordinate goroutines or "wait for" state changes. Synchronize through channels or observable state instead. `context.WithTimeout` is fine when the timeout itself is the thing under test.
 - Run `go test ./...` from the repo root; each package has its own `*_test.go` alongside the implementation.
+
+## Commits
+
+Keep commits minimal and focused. Multiple commits to accomplish a task are fine if they represent logical, well-separated steps that make the change easier to review.
+
+Use [conventional commit](https://www.conventionalcommits.org/) format: `<type>(<scope>): <description>`. Types: `build`, `chore`, `ci`, `docs`, `feat`, `fix`, `perf`, `refactor`, `revert`, `style`, `test`. Description in imperative mood, lowercase, no period, under 72 chars. Add body only if the "why" isn't obvious; wrap body lines at 72 characters. Always sign-off on commits (`-s`). Only add a "Co-authored-by" trailer if a human was not in the loop or if the user requested it.
+
+## Pull Requests
+
+PR titles should be capitalized, imperative mood, no conventional commit prefixes (e.g. "Add login page" not "feat: add login page"). Prefix PR titles with the correct emoji based on the change type: 🎣 Bug fix, 🐋 New feature, 📜 Documentation, ✨ General improvement. Always use the repo's `.github/pull_request_template.md` — fill in each section from the commits/diff, replace HTML comment placeholders with actual content. For checklist items that can be resolved automatically (like emoji prefixes), mark them as complete. Use prose in summaries. Reference related issues (e.g. "Closes #123", "Ref #124"). Keep changes minimal and focused for quick review.

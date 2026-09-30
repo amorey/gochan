@@ -942,3 +942,31 @@ func TestCancelledWithPendingValuesNeedsClose(t *testing.T) {
 		assert.Zero(t, registered(h))
 	})
 }
+
+// TestChanThenDirectRecvPanics pins the Chan ownership rule: once Chan
+// has handed the receiver to its feeder, a direct read would race the
+// feeder on pos and split values with it, so it panics instead. Close
+// stays allowed.
+func TestChanThenDirectRecvPanics(t *testing.T) {
+	recvs := map[string]func(*Receiver[int]){
+		"Recv":        func(rx *Receiver[int]) { _, _ = rx.Recv() },
+		"RecvContext": func(rx *Receiver[int]) { _, _ = rx.RecvContext(context.Background()) },
+		"TryRecv":     func(rx *Receiver[int]) { _, _ = rx.TryRecv() },
+	}
+	for name, recv := range recvs {
+		t.Run(name, func(t *testing.T) {
+			h := newHub[int](t, 4)
+			rx := newRx(t, h)
+			tx := newTx(t, h)
+			ch := rx.Chan()
+			require.NoError(t, tx.Send(1))
+			require.Equal(t, 1, <-ch)
+			assert.Panics(t, func() { recv(rx) })
+
+			rx.Close()
+			assert.Panics(t, func() { recv(rx) }, "still panics after Close")
+			_, ok := <-ch
+			assert.False(t, ok)
+		})
+	}
+}

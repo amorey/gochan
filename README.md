@@ -297,7 +297,7 @@ The send side has a matching boundary, and it resolves toward the buffer. On the
 
 **`oneshot`, `spsc`, `spmc`, `mpsc`, `mpmc`**: Concurrent `Send()`/`Close()` (or `Recv()`/`Close()`) on the same handle is not supported. To avoid any cross-thread race conditions, don't share handles across goroutines.
 
-**`broadcast`, `watch`**: Concurrent `Send()`/`Close()` is safe to share across goroutines.
+**`broadcast`, `watch`**: The `Sender` is safe to share across goroutines — concurrent `Send()`/`Close()` on it is fine. `Receiver`s are not: each receiver handle belongs to one consumer, so call `Hub.Receiver()` once per subscriber.
 
 ### Chan support
 
@@ -305,6 +305,6 @@ The send side has a matching boundary, and it resolves toward the buffer. On the
 
 - **Queue-style** (`spsc`, `spmc`, `mpsc`, `mpmc`): exposes the underlying buffered channel. `Receiver.Close()` does *not* close it — use `Recv`/`TryRecv` to observe receiver-close. It closes only when the sender closes and the buffer drains.
 
-- **Per-receiver feeder** (`broadcast`, `watch`): private channel fed by a per-receiver goroutine. `Receiver.Close()` *does* close it; always `Close` the receiver when done or the feeder leaks.
+- **Per-receiver feeder** (`broadcast`, `watch`): private channel fed by a per-receiver goroutine. `Receiver.Close()` *does* close it; always `Close` the receiver when done or the feeder leaks. Calling `Chan()` hands the receiver over to that feeder: from then on, read only from the channel. `Recv`, `RecvContext` and `TryRecv` on that receiver panic, since a second consumer would race the feeder and split values with it. `Close` is still allowed.
 
 For `oneshot`, `Chan()` is the one-slot delivery channel; sender-close closes it after the value is observed.

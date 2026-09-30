@@ -1085,3 +1085,29 @@ func TestRecvContextCancelledCloseUnregisters(t *testing.T) {
 	defer h.s.mu.Unlock()
 	assert.Empty(t, h.s.receivers, "receiver still registered with the hub")
 }
+
+// TestChanThenDirectRecvPanics pins the Chan ownership rule: once Chan
+// has handed the receiver to its feeder, a direct read would race the
+// feeder on lastSeen and split values with it, so it panics instead.
+// Close stays allowed.
+func TestChanThenDirectRecvPanics(t *testing.T) {
+	recvs := map[string]func(*Receiver[int]){
+		"Recv":        func(rx *Receiver[int]) { _, _ = rx.Recv() },
+		"RecvContext": func(rx *Receiver[int]) { _, _ = rx.RecvContext(context.Background()) },
+		"TryRecv":     func(rx *Receiver[int]) { _, _ = rx.TryRecv() },
+	}
+	for name, recv := range recvs {
+		t.Run(name, func(t *testing.T) {
+			h := newHub(t, 0)
+			rx := newRx(t, h)
+			ch := rx.Chan()
+			require.Equal(t, 0, <-ch)
+			assert.Panics(t, func() { recv(rx) })
+
+			rx.Close()
+			assert.Panics(t, func() { recv(rx) }, "still panics after Close")
+			_, ok := <-ch
+			assert.False(t, ok)
+		})
+	}
+}

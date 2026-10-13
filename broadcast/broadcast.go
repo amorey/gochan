@@ -586,21 +586,20 @@ func (rx *Receiver[T]) recvLoop(ctx context.Context) (T, error) {
 func (rx *Receiver[T]) TryRecv() (T, error) {
 	rx.checkNotChanMode()
 	var z T
-	if rx.done.IsClosed() {
-		return z, gochan.ErrClosed
-	}
-	// Fast path: no new data since rx last read. writePos and
-	// txClosed are atomic, so we can short-circuit without taking
-	// mu for the still-open case. rx.pos is owned by this goroutine.
-	// The EOF branch falls through to the locked section so it can
-	// unregister the receiver and release its slot in the ring.
-	if rx.s.writePos.Load() == rx.pos && !rx.s.txClosed.Load() {
+	// Fast path: live receiver, no new data since rx last read. done,
+	// writePos and txClosed are atomic, so we can short-circuit without
+	// taking mu for the still-open case. rx.pos is owned by this
+	// goroutine. The EOF branch falls through to the locked section so it
+	// can unregister the receiver and release its slot in the ring.
+	if !rx.done.IsClosed() && rx.s.writePos.Load() == rx.pos && !rx.s.txClosed.Load() {
 		return z, gochan.ErrEmpty
 	}
 	rx.s.mu.Lock()
 	defer rx.s.mu.Unlock()
-	// rx.done can flip between the lock-free check above and acquiring mu;
-	// Close holds mu before closing done, so a re-check here is race-free.
+	// The only closed check: Close holds mu before closing done, so this
+	// is race-free. A lock-free check before the fast path as well would
+	// leave this one reachable only when Close lands in between, which no
+	// test can hit deterministically.
 	if rx.done.IsClosed() {
 		return z, gochan.ErrClosed
 	}

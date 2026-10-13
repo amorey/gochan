@@ -750,13 +750,21 @@ func TestRecomputeMinWithEqualPositions(t *testing.T) {
 // "<-rx.done.Done()" arm in its send-to-rx.ch select. With no consumer
 // reading from Chan(), the feeder parks on "rx.ch <- v" after Recv
 // returns a value; Close fires done, unblocking it.
+//
+// Close must land only once the feeder is parked in that select: if it
+// lands while the feeder is still in recvLoop, recvLoop reports ErrClosed
+// and the arm under test is never entered, though the test still passes.
 func TestChanFeederBailsOnReceiverClose(t *testing.T) {
 	h := newHub[int](t, 4)
 	rx := newRx(t, h)
 	tx := newTx(t, h)
+	// No "broadcast." prefix: under -race, Chan is inlined into this test
+	// and the feeder's frame renders as
+	// "broadcast.TestChanFeederBailsOnReceiverClose.(*Receiver[...]).Chan.func1.1(".
+	base := parked.Snapshot(parked.InSelect, "(*Receiver[...]).Chan.func1.1(", "recvLoop(")
 	ch := rx.Chan()
 	require.NoError(t, tx.Send(1)) // feeder picks up, parks on `rx.ch <- v`
-	runtime.Gosched()
+	base.Wait(t, 1)
 	rx.Close()
 	// Drain whatever the feeder managed to enqueue, expect close.
 	timeout := time.After(time.Second)
@@ -772,12 +780,14 @@ func TestChanFeederBailsOnReceiverClose(t *testing.T) {
 	}
 }
 
-// TestRecvCloseRace hits the recvLoop / TryRecv re-check-under-mu branches
-// by racing Receiver.Close against Recv / TryRecv across many iterations.
-// Each subtest uses an independent receiver per consumer to respect
-// broadcast's single-consumer-per-receiver contract. The re-checks are
+// TestRecvCloseRace hits the recvLoop re-check-under-mu branch by racing
+// Receiver.Close against Recv / TryRecv across many iterations. Each
+// subtest uses an independent receiver per consumer to respect
+// broadcast's single-consumer-per-receiver contract. The re-check is
 // TOCTOU (done flips between the lock-free check and the mu acquisition),
-// so deterministic coverage isn't possible.
+// so deterministic coverage isn't possible. TryRecv has no such re-check
+// — its only closed check is under mu — but racing it still guards
+// against a close being missed.
 func TestRecvCloseRace(t *testing.T) {
 	consumers := []struct {
 		name string

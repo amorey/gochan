@@ -58,6 +58,14 @@
 // N producers you must close all N — a forgotten Close on any one of
 // them leaves receivers waiting forever for an EOF that never arrives.
 //
+// Keep-open mode. A hub built with [WithKeepOpen] has no sender-driven
+// end-of-stream: closing a sender only releases that handle, and
+// [Hub.Sender] keeps minting live senders however often the count drops
+// to zero. The stream ends only on [Hub.Close] (Chan drains, then
+// closes) or once every receiver has closed. Such a hub counts as having
+// a sender from construction, so TryRecv reports [gochan.ErrEmpty]
+// rather than [gochan.ErrNotReady] before the first [Hub.Sender] call.
+//
 // All receivers closed ⇒ senders see ErrClosed. Once at least one
 // receiver has been registered, every sender's next
 // Send/TrySend/SendContext returns [gochan.ErrClosed] if every receiver
@@ -97,7 +105,7 @@ type shared[T any] struct {
 	txReady chancore.CloseOnce // closed when the first Sender is registered
 
 	mu      sync.Mutex // guards txCount and rxCount
-	txCount int        // number of still-open senders
+	txCount int        // number of still-open senders; a keep-open hub holds one itself
 	rxCount int        // number of still-open receivers
 
 	send chancore.BufferedSend[T]
@@ -128,6 +136,24 @@ type Receiver[T any] struct {
 	done chancore.CloseOnce
 }
 
+// Option configures a [Hub] at construction. See [WithKeepOpen].
+type Option func(*options)
+
+type options struct {
+	keepOpen bool
+}
+
+// WithKeepOpen keeps the hub open after its last sender closes. Without
+// it, the hub reaches end-of-stream once every registered sender has
+// closed, and later [Hub.Sender] calls return pre-closed handles. With
+// it, [Sender.Close] only releases that handle: [Hub.Sender] keeps
+// minting live senders and the stream ends only on [Hub.Close] or once
+// every receiver has closed. Use it for fan-in whose producers come and
+// go for as long as the consumers run.
+func WithKeepOpen() Option {
+	return func(o *options) { o.keepOpen = true }
+}
+
 // New creates a fresh mpmc Hub backed by a buffered Go channel of
 // the given capacity. capacity == 0 yields a rendezvous channel where
 // every Send blocks until some receiver is ready. capacity < 0 panics.
@@ -138,14 +164,25 @@ type Receiver[T any] struct {
 // one Sender is registered via [Hub.Sender] and a value is sent. The
 // implicit-close rules only kick in once each side has had at least one
 // registration — a fresh hub is not implicitly closed.
-func New[T any](capacity int) *Hub[T] {
+func New[T any](capacity int, opts ...Option) *Hub[T] {
 	if capacity < 0 {
 		panic("mpmc: negative capacity")
+	}
+	var o options
+	for _, opt := range opts {
+		opt(&o)
 	}
 	s := &shared[T]{ch: make(chan T, capacity)}
 	s.dead.Init()
 	s.rxReady.Init()
 	s.txReady.Init()
+	if o.keepOpen {
+		// The hub holds a sender of its own for its whole life, so the
+		// count never reaches zero and the last Sender.Close never
+		// closes ch. Only Hub.Close does, directly.
+		s.txCount = 1
+		s.txReady.Close()
+	}
 	s.send = chancore.BufferedSend[T]{
 		Ch:        s.ch,
 		Dead:      &s.dead,
@@ -162,7 +199,8 @@ func New[T any](capacity int) *Hub[T] {
 // hub has been closed (explicitly via [Hub.Close], implicitly because
 // every previously-registered sender has already closed, or because
 // every previously-registered receiver has already closed) the returned
-// handle is pre-closed and reports [gochan.ErrClosed] on use.
+// handle is pre-closed and reports [gochan.ErrClosed] on use. A hub
+// built with [WithKeepOpen] never closes on its senders' account.
 func (h *Hub[T]) Sender() *Sender[T] {
 	s := h.s
 	s.mu.Lock()
@@ -248,7 +286,8 @@ func (tx *Sender[T]) SendContext(ctx context.Context, v T) error {
 // Close closes this sender only. Other senders continue to produce.
 // Subsequent Send/TrySend/SendContext calls on this handle return
 // [gochan.ErrClosed]. Receivers only observe ErrClosed (after draining)
-// when every sender has been closed. Idempotent. Intended to be called
+// when every sender has been closed; on a [WithKeepOpen] hub closing a
+// sender never ends the stream. Idempotent. Intended to be called
 // by the producer goroutine that owns this sender — mpmc does not
 // synchronize concurrent callers on the same sender handle.
 func (tx *Sender[T]) Close() {

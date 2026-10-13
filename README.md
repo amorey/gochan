@@ -131,6 +131,12 @@ for {
 }
 ```
 
+By default the last sender closing is end-of-stream: afterwards `hub.Sender()` hands out pre-closed senders. If producers come and go for as long as the consumer runs (e.g. one goroutine per log stream, where the set of streams can drop to zero and refill), build the hub with `mpsc.WithKeepOpen()`. Then `Sender.Close()` only releases that handle, `hub.Sender()` keeps minting live senders, and the stream ends only on `hub.Close()` (`Chan` drains, then closes) or `rx.Close()`. `mpmc.WithKeepOpen()` does the same for MPMC.
+
+```go
+hub := mpsc.New[Line](256, mpsc.WithKeepOpen())
+```
+
 [Recv Example](./mpsc/examples/recv/main.go) · [Chan Example](./mpsc/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gochan/mpsc)
 
 ### MPMC (Multiple-Producer/Multiple-Consumer)
@@ -259,7 +265,7 @@ var ErrNotReady = errors.New("gochan: no counterparty registered")
 type ErrLagged struct{ Missed uint64 }  // broadcast only
 ```
 
-`ErrNotReady` is returned by `TrySend` on fan-out packages (`spmc`, `mpmc`) before any receiver is registered, and by `TryRecv` on fan-in packages (`mpsc`, `mpmc`) before any sender is registered — distinguishing "no counterparty yet" from transient `ErrFull`/`ErrEmpty`. `ErrLagged` is `broadcast`-only: the slow receiver fell behind the ring buffer and resumes from the oldest still-buffered value.
+`ErrNotReady` is returned by `TrySend` on fan-out packages (`spmc`, `mpmc`) before any receiver is registered, and by `TryRecv` on fan-in packages (`mpsc`, `mpmc`) before any sender is registered (except on a `WithKeepOpen()` hub, which is open from construction and reports `ErrEmpty`) — distinguishing "no counterparty yet" from transient `ErrFull`/`ErrEmpty`. `ErrLagged` is `broadcast`-only: the slow receiver fell behind the ring buffer and resumes from the oldest still-buffered value.
 
 `ErrClosed` outranks context cancellation in `SendContext`: if the sender is already closed when the call is entered, it returns `ErrClosed` even for an already-cancelled `ctx`, since `ErrClosed` is the durable answer and a retry with a fresh context would only return it anyway. A cancelled `ctx` on a live sender still returns `ctx.Err()`. Once the call is parked, a close and a cancellation landing together resolve at random — treat either error as terminal for that send.
 
@@ -283,7 +289,7 @@ If a value and a cancellation arrive together while parked:
 
 | Call                | Effect                                                                                                    |
 | ------------------- | --------------------------------------------------------------------------------------------------------- |
-| `Sender.Close()`    | Graceful end-of-stream. On queue-style channels, `Recv` and `Chan` drain buffered values, then see `ErrClosed` / channel-closed. |
+| `Sender.Close()`    | Graceful end-of-stream. On queue-style channels, `Recv` and `Chan` drain buffered values, then see `ErrClosed` / channel-closed. On `mpsc`/`mpmc` hubs built with `WithKeepOpen()`, it only releases that handle. |
 | `Receiver.Close()`  | This handle only. Other receivers and the sender keep running; buffered values are abandoned for this handle. |
 | `Hub.Close()`       | Hub-style packages. Equivalent to closing every receiver then the sender: `Recv` sees `ErrClosed` immediately; queue-style `Chan` drains, per-receiver-feeder `Chan` (`broadcast`, `watch`) closes without draining. For `watch`, use `Sender.Close()` instead if receivers should observe the latest value once before shutdown. |
 
@@ -303,7 +309,7 @@ The send side has a matching boundary, and it resolves toward the buffer. On the
 
 `Chan()` comes in two flavors:
 
-- **Queue-style** (`spsc`, `spmc`, `mpsc`, `mpmc`): exposes the underlying buffered channel. `Receiver.Close()` does *not* close it — use `Recv`/`TryRecv` to observe receiver-close. It closes only when the sender closes and the buffer drains.
+- **Queue-style** (`spsc`, `spmc`, `mpsc`, `mpmc`): exposes the underlying buffered channel. `Receiver.Close()` does *not* close it — use `Recv`/`TryRecv` to observe receiver-close. It closes only when the sender closes and the buffer drains — or, on a `WithKeepOpen()` hub, only on `Hub.Close()`.
 
 - **Per-receiver feeder** (`broadcast`, `watch`): private channel fed by a per-receiver goroutine. `Receiver.Close()` *does* close it; always `Close` the receiver when done or the feeder leaks. Calling `Chan()` hands the receiver over to that feeder: from then on, read only from the channel. `Recv`, `RecvContext` and `TryRecv` on that receiver panic, since a second consumer would race the feeder and split values with it. `Close` is still allowed.
 

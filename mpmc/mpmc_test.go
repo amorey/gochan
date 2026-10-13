@@ -961,3 +961,58 @@ func TestHubCloseRaceWithBlockedSender(t *testing.T) {
 		assert.ErrorIs(t, tx.Send(3), gochan.ErrClosed)
 	}
 }
+
+func TestKeepOpenLastSenderCloseKeepsHubOpen(t *testing.T) {
+	h := New[int](1, WithKeepOpen())
+	rx := newRx(t, h)
+	tx := newTx(t, h)
+	tx.Close()
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gochan.ErrEmpty)
+}
+
+func TestKeepOpenSenderAfterAllClosedIsLive(t *testing.T) {
+	h := New[int](1, WithKeepOpen())
+	rx := newRx(t, h)
+	newTx(t, h).Close()
+	tx := newTx(t, h)
+	require.NoError(t, tx.Send(42))
+	v, err := rx.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, 42, v)
+}
+
+// A keep-open hub is open from construction, so an empty buffer before any
+// sender registers is ErrEmpty rather than ErrNotReady.
+func TestKeepOpenTryRecvFreshHubReportsEmpty(t *testing.T) {
+	h := New[int](1, WithKeepOpen())
+	rx := newRx(t, h)
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gochan.ErrEmpty)
+}
+
+// Hub.Close is the end-of-stream for a keep-open hub: Chan drains what is
+// buffered and then closes, and later senders are pre-closed.
+func TestKeepOpenHubCloseEndsStream(t *testing.T) {
+	h := New[int](2, WithKeepOpen())
+	rx := newRx(t, h)
+	tx := newTx(t, h)
+	require.NoError(t, tx.Send(1))
+	tx.Close()
+	h.Close()
+	var got []int
+	for v := range rx.Chan() {
+		got = append(got, v)
+	}
+	assert.Equal(t, []int{1}, got)
+	assert.ErrorIs(t, h.Sender().Send(2), gochan.ErrClosed)
+}
+
+func TestKeepOpenAllReceiversClosedSendersSeeClosed(t *testing.T) {
+	h := New[int](1, WithKeepOpen())
+	rx := newRx(t, h)
+	tx := newTx(t, h)
+	rx.Close()
+	assert.ErrorIs(t, tx.Send(1), gochan.ErrClosed)
+	assert.ErrorIs(t, h.Sender().Send(1), gochan.ErrClosed)
+}

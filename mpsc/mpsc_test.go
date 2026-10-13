@@ -453,3 +453,26 @@ func TestMultiProducerFanIn(t *testing.T) {
 	<-done
 	assert.Equal(t, int64(producers*itemsPer), consumed)
 }
+
+// Producers come and go: the sender count drops to zero and a new sender
+// sends afterwards, with the receiver still open throughout.
+func TestKeepOpenSendersDropToZeroThenResume(t *testing.T) {
+	h := New[int](1, WithKeepOpen())
+	rx := h.Receiver()
+
+	tx := newTx(t, h)
+	require.NoError(t, tx.Send(1))
+	tx.Close()
+	v, err := rx.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, 1, v)
+
+	_, err = rx.TryRecv()
+	require.ErrorIs(t, err, gochan.ErrEmpty, "hub closed when its last sender closed")
+
+	tx = newTx(t, h)
+	require.NoError(t, tx.Send(2))
+	v, err = rx.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, 2, v)
+}

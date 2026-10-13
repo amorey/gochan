@@ -44,6 +44,13 @@
 // producers you must close all N — a forgotten Close on any one of them
 // leaves the receiver waiting forever for an EOF that never arrives.
 //
+// Keep-open mode. A hub built with [WithKeepOpen] has no sender-driven
+// end-of-stream: closing a sender only releases that handle, and
+// [Hub.Sender] keeps minting live senders however often the count drops
+// to zero. The stream ends only on [Hub.Close] (Chan drains, then
+// closes) or [Receiver.Close]. Use it when producers come and go for as
+// long as the consumer runs.
+//
 // Receiver close stops everything. Closing the receiver immediately fails
 // every pending and future Send across all senders with
 // [gochan.ErrClosed] and abandons any buffered values.
@@ -79,6 +86,26 @@ type Sender[T any] struct{ tx *mpmc.Sender[T] }
 // Receiver is the singleton receive-side handle of an mpsc pipeline.
 type Receiver[T any] struct{ rx *mpmc.Receiver[T] }
 
+// Option configures a [Hub] at construction. See [WithKeepOpen].
+type Option func(*options)
+
+// options collects the mpmc options an mpsc option forwards to the
+// underlying hub.
+type options struct {
+	mpmc []mpmc.Option
+}
+
+// WithKeepOpen keeps the hub open after its last sender closes. Without
+// it, the receiver sees end-of-stream once every registered sender has
+// closed, and later [Hub.Sender] calls return pre-closed handles. With
+// it, [Sender.Close] only releases that handle: [Hub.Sender] keeps
+// minting live senders and the stream ends only on [Hub.Close] or
+// [Receiver.Close]. Use it for fan-in whose producers come and go for
+// as long as the consumer runs, e.g. one goroutine per log stream.
+func WithKeepOpen() Option {
+	return func(o *options) { o.mpmc = append(o.mpmc, mpmc.WithKeepOpen()) }
+}
+
 // New creates a fresh mpsc Hub backed by a buffered Go channel of
 // the given capacity. capacity == 0 yields a rendezvous channel where
 // every Send blocks until the receiver is ready. capacity < 0 panics.
@@ -88,12 +115,17 @@ type Receiver[T any] struct{ rx *mpmc.Receiver[T] }
 // report ErrNotReady) until at least one producer is registered and sends a
 // value. The "all senders closed ⇒ ErrClosed" rule only kicks in once at
 // least one sender has been registered — a fresh hub is not implicitly
-// closed.
-func New[T any](capacity int) *Hub[T] {
+// closed. With [WithKeepOpen] that rule never applies, and TryRecv on a
+// fresh hub reports [gochan.ErrEmpty] instead of ErrNotReady.
+func New[T any](capacity int, opts ...Option) *Hub[T] {
 	if capacity < 0 {
 		panic("mpsc: negative capacity")
 	}
-	h := mpmc.New[T](capacity)
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+	h := mpmc.New[T](capacity, o.mpmc...)
 	return &Hub[T]{h: h, rx: &Receiver[T]{rx: h.Receiver()}}
 }
 
@@ -104,7 +136,8 @@ func New[T any](capacity int) *Hub[T] {
 // been closed (explicitly via [Hub.Close], or implicitly because every
 // previously-registered sender has already closed) or the receiver has
 // been closed, the returned handle is pre-closed and reports
-// [gochan.ErrClosed] on use.
+// [gochan.ErrClosed] on use. A hub built with [WithKeepOpen] never
+// closes on its senders' account.
 func (h *Hub[T]) Sender() *Sender[T] { return &Sender[T]{tx: h.h.Sender()} }
 
 // Receiver returns the singleton receive-side handle. Repeated calls
@@ -145,7 +178,8 @@ func (tx *Sender[T]) SendContext(ctx context.Context, v T) error {
 // Close closes this sender only. Other senders continue to produce.
 // Subsequent Send/TrySend/SendContext calls on this handle return
 // [gochan.ErrClosed]. The receiver only observes ErrClosed (after
-// draining) when every sender has been closed. Idempotent. Intended to
+// draining) when every sender has been closed; on a [WithKeepOpen] hub
+// closing a sender never ends the stream. Idempotent. Intended to
 // be called by the producer goroutine that owns this sender — mpsc does
 // not synchronize concurrent callers on the same sender handle.
 func (tx *Sender[T]) Close() { tx.tx.Close() }

@@ -27,36 +27,48 @@ type architecture struct {
 	// newPair returns a fresh, live sender/receiver pair. For hub-style
 	// packages it mints one of each from a fresh hub.
 	newPair func() (gochan.Sender[int], gochan.Receiver[int])
+	// keepOpen marks a hub built with WithKeepOpen, where sender-close
+	// releases the handle but is not end-of-stream.
+	keepOpen bool
 }
 
-// architectures covers all seven packages. Capacity 1 is enough for every
-// case below: none of them needs more than one value in flight.
+// architectures covers all seven packages plus the keep-open mode of the
+// two fan-in hubs. Capacity 1 is enough for every case below: none of them
+// needs more than one value in flight.
 var architectures = []architecture{
-	{"oneshot", func() (gochan.Sender[int], gochan.Receiver[int]) {
+	{name: "oneshot", newPair: func() (gochan.Sender[int], gochan.Receiver[int]) {
 		tx, rx := oneshot.New[int]()
 		return tx, rx
 	}},
-	{"spsc", func() (gochan.Sender[int], gochan.Receiver[int]) {
+	{name: "spsc", newPair: func() (gochan.Sender[int], gochan.Receiver[int]) {
 		tx, rx := spsc.New[int](1)
 		return tx, rx
 	}},
-	{"spmc", func() (gochan.Sender[int], gochan.Receiver[int]) {
+	{name: "spmc", newPair: func() (gochan.Sender[int], gochan.Receiver[int]) {
 		h := spmc.New[int](1)
 		return h.Sender(), h.Receiver()
 	}},
-	{"mpsc", func() (gochan.Sender[int], gochan.Receiver[int]) {
+	{name: "mpsc", newPair: func() (gochan.Sender[int], gochan.Receiver[int]) {
 		h := mpsc.New[int](1)
 		return h.Sender(), h.Receiver()
 	}},
-	{"mpmc", func() (gochan.Sender[int], gochan.Receiver[int]) {
+	{name: "mpmc", newPair: func() (gochan.Sender[int], gochan.Receiver[int]) {
 		h := mpmc.New[int](1)
 		return h.Sender(), h.Receiver()
 	}},
-	{"broadcast", func() (gochan.Sender[int], gochan.Receiver[int]) {
+	{name: "mpsc/keepopen", newPair: func() (gochan.Sender[int], gochan.Receiver[int]) {
+		h := mpsc.New[int](1, mpsc.WithKeepOpen())
+		return h.Sender(), h.Receiver()
+	}, keepOpen: true},
+	{name: "mpmc/keepopen", newPair: func() (gochan.Sender[int], gochan.Receiver[int]) {
+		h := mpmc.New[int](1, mpmc.WithKeepOpen())
+		return h.Sender(), h.Receiver()
+	}, keepOpen: true},
+	{name: "broadcast", newPair: func() (gochan.Sender[int], gochan.Receiver[int]) {
 		h := broadcast.New[int](1)
 		return h.Sender(), h.Receiver()
 	}},
-	{"watch", func() (gochan.Sender[int], gochan.Receiver[int]) {
+	{name: "watch", newPair: func() (gochan.Sender[int], gochan.Receiver[int]) {
 		h := watch.New(0)
 		return h.Sender(), h.Receiver()
 	}},
@@ -114,6 +126,12 @@ func TestRecvContextPrecedenceConformance(t *testing.T) {
 				}
 				tx.Close()
 				_, err := rx.RecvContext(cancelled())
+				if a.keepOpen {
+					// Sender-close is not terminal here, so the
+					// cancellation is the answer.
+					assert.ErrorIs(t, err, context.Canceled)
+					return
+				}
 				assert.ErrorIs(t, err, gochan.ErrClosed)
 			})
 
@@ -176,6 +194,14 @@ func TestSenderCloseDrainsBeforeClosedConformance(t *testing.T) {
 			v, err := rx.Recv()
 			require.NoError(t, err, "sender-close pre-empted a pending value")
 			assert.Equal(t, 42, v)
+
+			if a.keepOpen {
+				// Sender-close is not end-of-stream on a keep-open
+				// hub: drained but still open.
+				_, err = rx.TryRecv()
+				assert.ErrorIs(t, err, gochan.ErrEmpty)
+				return
+			}
 
 			// ...and only then is the stream terminal.
 			_, err = rx.Recv()
@@ -244,7 +270,13 @@ func TestTryRecvFlushTerminatesOnAnyError(t *testing.T) {
 						}
 					}
 					require.Error(t, err, "flush loop never reached a terminal error")
-					if closeSender {
+					if !closeSender {
+						return
+					}
+					if a.keepOpen {
+						assert.ErrorIs(t, err, gochan.ErrEmpty,
+							"a keep-open hub stays open after sender-close")
+					} else {
 						assert.ErrorIs(t, err, gochan.ErrClosed,
 							"a closed sender ends the flush with ErrClosed, never ErrEmpty")
 					}

@@ -518,14 +518,15 @@ func (rx *Receiver[T]) feed() {
 		}
 	}()
 	for {
-		if rx.done.IsClosed() {
-			return
-		}
 		s.mu.Lock()
 		if parked {
 			s.waiters--
 			parked = false
 		}
+		// The only closed check: Close holds mu before closing done, so
+		// this is race-free. A lock-free check before taking mu as well
+		// would leave this one reachable only when Close lands in
+		// between, which no test can hit deterministically.
 		if rx.done.IsClosed() {
 			s.mu.Unlock()
 			return

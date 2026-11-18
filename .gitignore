@@ -6,6 +6,7 @@
 /chan
 /recv
 *.test
+/stress/
 *.out
 *.exe
 *.dll

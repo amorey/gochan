@@ -758,6 +758,17 @@ func TestChanClosesOnReceiverClose(t *testing.T) {
 	}
 }
 
+// TestChanAfterReceiverClose covers feed's closed check under mu: the
+// feeder's first iteration finds done already closed and exits without
+// delivering the pending initial value.
+func TestChanAfterReceiverClose(t *testing.T) {
+	h := newHub(t, 0)
+	rx := newRx(t, h)
+	rx.Close()
+	_, ok := <-rx.Chan()
+	assert.False(t, ok)
+}
+
 func TestChanReturnsSame(t *testing.T) {
 	h := newHub(t, 0)
 	rx := newRx(t, h)

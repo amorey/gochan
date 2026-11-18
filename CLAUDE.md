@@ -76,6 +76,29 @@ semantics tables, error meanings). When changing public behavior, update
 - Do not use magic sleeps (`time.Sleep`, or `time.After` timeouts whose duration encodes an assumption about scheduling) to coordinate goroutines or "wait for" state changes. Synchronize through channels or observable state instead. `context.WithTimeout` is fine when the timeout itself is the thing under test.
 - Run `go test ./...` from the repo root; each package has its own `*_test.go` alongside the implementation.
 
+### Nightly stress run
+
+`.github/workflows/stress.yml` runs at 05:00 UTC (and on
+`workflow_dispatch`, with `count` and `cpu` inputs). It runs
+`go test -cpu <n> -shuffle=on -count=3 ./...` on Go 1.26 across Linux,
+macOS and Windows on amd64 and arm64, each with and without `-race`
+(no race on windows/arm64), one job per `-cpu` value (`1` and `4` by
+default). `scripts/stress.go` turns each job's `go test -json` output
+into `failures.json`.
+
+A red stress run means a concurrency bug was found, and nothing else: a
+test that passes on PR CI but fails here under another order, runner or
+repetition. Don't retry it away or mark it flaky.
+
+On failure the `report` job opens one `needs-triage` issue per failing
+test (`Stress: <Test> fails in <package>`), or comments on the open one
+with that title, and one `Stress run failed outside a test` issue for
+build failures, cancels and lost runners. To reproduce, run the command
+from the issue at the repo root on the named OS/arch, e.g.
+`go test -race -cpu 4 -shuffle=<seed> -count=3 ./mpmc`. It runs the
+whole package because the seed orders all of it. The job's `stress-*`
+artifact holds the raw `stress.json` for 14 days.
+
 ## Commits
 
 Keep commits minimal and focused. Multiple commits to accomplish a task are fine if they represent logical, well-separated steps that make the change easier to review.

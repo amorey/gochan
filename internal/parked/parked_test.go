@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -50,18 +51,39 @@ const (
 	wrapperFrame = "parked.blockViaWrapper("
 )
 
-// park spawns n goroutines in blockForTest and returns a release func.
-// Every test releases its goroutines: a leaked one would be counted by
-// the next test's Wait, which is the exact hazard Wait's exact-count
-// check exists to report.
+// spawn starts n goroutines in block and registers a cleanup that
+// releases them and waits for them to exit.
+//
+// Releasing alone is not enough: a released goroutine stays in the dump
+// as "runnable" inside blockForTest until the scheduler gets to it, so a
+// later test that inspects every goroutine in that frame — under -shuffle
+// or -count, any test may run next — would see it in the wrong state.
+// Waiting for exit keeps each test's goroutines out of the next one's
+// dump. A leftover would also be counted by the next test's Wait, which
+// is the exact hazard Wait's exact-count check exists to report.
+func spawn(t *testing.T, n int, block func(chan struct{})) {
+	t.Helper()
+	ch := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			block(ch)
+		}()
+	}
+	t.Cleanup(func() {
+		close(ch)
+		wg.Wait()
+	})
+}
+
+// park spawns n goroutines in blockForTest and returns the baseline taken
+// just before.
 func park(t *testing.T, n int) *Baseline {
 	t.Helper()
 	base := Snapshot(InChanRecv, blockFrame)
-	ch := make(chan struct{})
-	for i := 0; i < n; i++ {
-		go blockForTest(ch)
-	}
-	t.Cleanup(func() { close(ch) })
+	spawn(t, n, blockForTest)
 	return base
 }
 
@@ -223,13 +245,10 @@ func TestHeaderID(t *testing.T) {
 // the match to direct callers — without which a test spawning one of each
 // would trip Wait's over-count check for no real reason.
 func TestSnapshotNotFramesExcludesDelegators(t *testing.T) {
-	ch := make(chan struct{})
-	t.Cleanup(func() { close(ch) })
-
 	direct := Snapshot(InChanRecv, blockFrame, wrapperFrame)
 	both := Snapshot(InChanRecv, blockFrame)
-	go blockForTest(ch)
-	go blockViaWrapper(ch)
+	spawn(t, 1, blockForTest)
+	spawn(t, 1, blockViaWrapper)
 
 	// Both goroutines park in blockForTest, so the unfiltered baseline
 	// sees two; the filtered one sees only the direct caller.

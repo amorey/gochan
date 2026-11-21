@@ -757,17 +757,25 @@ func TestMultiProducerMultiConsumer(t *testing.T) {
 		}()
 	}
 
+	// Mint every sender before any producer starts: if one producer
+	// finished and closed its sender while the next was still unminted,
+	// the sender count would hit zero, end the stream, and hand the late
+	// producers pre-closed senders.
+	txs := make([]*Sender[int], producers)
+	for i := range txs {
+		txs[i] = newTx(t, h)
+	}
+
 	producerWG := sync.WaitGroup{}
 	producerWG.Add(producers)
-	for i := 0; i < producers; i++ {
-		tx := newTx(t, h)
-		go func(p int) {
+	for i, tx := range txs {
+		go func(p int, tx *Sender[int]) {
 			defer producerWG.Done()
 			defer tx.Close()
 			for j := 0; j < itemsPer; j++ {
 				assert.NoError(t, tx.Send(p*itemsPer+j))
 			}
-		}(i)
+		}(i, tx)
 	}
 
 	producerWG.Wait()
